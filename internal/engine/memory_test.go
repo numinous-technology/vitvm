@@ -190,3 +190,42 @@ func TestPushPullAndWarmForkOfMachineCheckpoints(t *testing.T) {
 		t.Fatalf("warm fork after pull: mem=%q f=%q", fm2.Memory(fork.ID), guestFile(t, fm2, fork.ID, "f"))
 	}
 }
+
+func TestStepsTakeDiffSnapshotsAndTheyReassemble(t *testing.T) {
+	e, fm := machineEngine(t)
+	s, _ := e.Create("vm")
+	fm.Boot(context.Background(), s.ID, "")
+	var mems [][]byte
+	var cks []*Checkpoint
+	for i := 0; i < 4; i++ {
+		fm.Touch(s.ID, []byte(strings.Repeat(string(rune('a'+i)), 5000))) // dirties new pages each step
+		cks = append(cks, step(t, e, s, "true"))
+		mems = append(mems, fm.Memory(s.ID))
+	}
+	if fm.Diffs != 3 {
+		t.Fatalf("took %d diff snapshots, want 3 (every step after the first)", fm.Diffs)
+	}
+	// every step reassembles to exactly its memory, through the diff chain
+	for i, c := range cks {
+		fork, err := e.Fork(c.ID, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(fm.Memory(fork.ID), mems[i]) {
+			t.Fatalf("step %d reassembled wrong", i+1)
+		}
+	}
+	// after a checkout the next step diffs against the checked-out image
+	e.Checkout(s, cks[1].ID)
+	before := fm.Diffs
+	fm.Touch(s.ID, []byte("after-checkout"))
+	c := step(t, e, s, "true")
+	want := fm.Memory(s.ID)
+	if fm.Diffs != before+1 {
+		t.Fatal("the step after a checkout should be a diff against the checked-out image")
+	}
+	fork, _ := e.Fork(c.ID, "")
+	if !bytes.Equal(fm.Memory(fork.ID), want) {
+		t.Fatal("diff after checkout reassembled wrong")
+	}
+}

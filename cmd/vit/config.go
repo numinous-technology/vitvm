@@ -16,14 +16,16 @@ import (
 // Repo configuration lives in .vit/config.json. Every key can be overridden by
 // an environment variable: firecracker.kernel -> VIT_FIRECRACKER_KERNEL.
 var configKeys = map[string]string{
-	"backend":              "backend for new sandboxes: process (default) or firecracker",
-	"firecracker.bin":      "path to the firecracker binary (default: firecracker on PATH)",
-	"firecracker.kernel":   "guest kernel (uncompressed vmlinux)",
-	"firecracker.rootfs":   "base root filesystem (scripts/build-rootfs.sh)",
-	"firecracker.vcpus":    "guest vCPUs (default 1)",
-	"firecracker.mem_mib":  "guest memory in MiB (default 512)",
-	"firecracker.run_dir":  "where running VMs keep their sockets and disks (default /tmp/vit-fc)",
-	"firecracker.bootargs": "guest kernel command line (default starts the vit agent)",
+	"backend":               "backend for new sandboxes: process (default) or firecracker",
+	"firecracker.bin":       "path to the firecracker binary (default: firecracker on PATH)",
+	"firecracker.kernel":    "guest kernel (uncompressed vmlinux)",
+	"firecracker.rootfs":    "base root filesystem (scripts/build-rootfs.sh)",
+	"firecracker.vcpus":     "guest vCPUs (default 1)",
+	"firecracker.mem_mib":   "guest memory in MiB (default 512)",
+	"firecracker.run_dir":   "where running VMs keep their sockets and disks (default /tmp/vit-fc)",
+	"firecracker.bootargs":  "guest kernel command line (default starts the vit agent)",
+	"firecracker.disk_mode": "overlay (default: shared read-only base + small writable disk) or copy",
+	"firecracker.upper_gib": "size of the sparse writable disk in overlay mode (default 8)",
 }
 
 type config struct {
@@ -88,6 +90,8 @@ func (c *config) backend(name string) (engine.Backend, error) {
 			VCPUs:          c.intv("firecracker.vcpus"),
 			MemMiB:         c.intv("firecracker.mem_mib"),
 			BootArgs:       c.get("firecracker.bootargs"),
+			DiskMode:       c.get("firecracker.disk_mode"),
+			UpperGiB:       c.intv("firecracker.upper_gib"),
 		})
 	}
 	return nil, fmt.Errorf("unknown backend %q (process or firecracker)", name)

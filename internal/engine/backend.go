@@ -37,9 +37,19 @@ type GuestFS interface {
 
 // Image is a snapshot of a running machine, as files on the host.
 type Image struct {
-	Memory string // guest memory
+	Memory string // guest memory, or only the pages dirtied since Base when MemoryIsDiff
 	State  string // device and vCPU state
-	Disk   string // the root disk at the same instant; "" if the backend has none
+	Disk   string // the writable disk at the same instant; "" if the backend has none
+	// BaseDisk is a read-only disk the machine's filesystem is layered over, if
+	// any. It never changes, so the engine stores it once per distinct file.
+	BaseDisk string
+
+	// MemoryIsDiff marks a diff snapshot: Memory is a sparse file holding only
+	// the pages dirtied since the image named by Base.
+	MemoryIsDiff bool
+	// Base names the stored memory image this one is relative to (on
+	// Snapshot) or is (on Resume). The engine uses the memory manifest hash.
+	Base string
 }
 
 // MemoryBackend is a Backend that also snapshots and resumes a running
@@ -54,11 +64,18 @@ type MemoryBackend interface {
 	// Running reports whether the sandbox's machine is up.
 	Running(ctx context.Context, sandboxID string) bool
 	// Snapshot pauses the machine, writes its memory, state and disk under dir,
-	// and resumes it, so stepping continues from where it paused.
-	Snapshot(ctx context.Context, sandboxID, dir string) (Image, error)
+	// and resumes it, so stepping continues from where it paused. base names
+	// the image the engine believes the machine's memory derives from; when
+	// the backend can confirm it (see Rebase), it may write only the pages
+	// dirtied since, and set MemoryIsDiff. Otherwise it writes all of memory.
+	Snapshot(ctx context.Context, sandboxID, dir, base string) (Image, error)
+	// Rebase records that the machine's memory now equals the stored image
+	// named base, so the next Snapshot can be a diff against it.
+	Rebase(ctx context.Context, sandboxID, base string) error
 	// Resume starts the sandbox's machine from an image, stopping any machine
-	// the sandbox already has. Checkout resumes a sandbox's own image; fork
-	// resumes another sandbox's image under a new id.
+	// the sandbox already has; img.Base names the image, and becomes the base
+	// for the next diff. Checkout resumes a sandbox's own image; fork resumes
+	// another sandbox's image under a new id.
 	Resume(ctx context.Context, sandboxID, workDir string, img Image) error
 	// Shutdown stops the sandbox's machine.
 	Shutdown(ctx context.Context, sandboxID string) error

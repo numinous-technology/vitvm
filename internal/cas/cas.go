@@ -42,11 +42,27 @@ func (s *Store) Put(b []byte) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return "", err
 	}
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	// a unique temp file per writer: concurrent writers of the same blob write
+	// identical bytes, so whichever rename lands last is fine
+	f, err := os.CreateTemp(filepath.Dir(p), ".put-*")
+	if err != nil {
 		return "", err
 	}
-	return hash, os.Rename(tmp, p)
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	os.Chmod(f.Name(), 0o644)
+	if err := os.Rename(f.Name(), p); err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	return hash, nil
 }
 
 // PutFile stores a file's contents by streaming it, returning the hash and
@@ -73,16 +89,17 @@ func (s *Store) PutFile(path string) (string, int64, error) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return "", 0, err
 	}
-	tmp := dst + ".tmp"
-	out, err := os.Create(tmp)
+	out, err := os.CreateTemp(filepath.Dir(dst), ".put-*")
 	if err != nil {
 		return "", 0, err
 	}
+	tmp := out.Name()
 	if _, err := io.Copy(out, f); err != nil {
 		out.Close()
 		return "", 0, err
 	}
 	out.Close()
+	os.Chmod(tmp, 0o644)
 	return hash, n, os.Rename(tmp, dst)
 }
 

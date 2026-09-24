@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -27,11 +28,42 @@ type FakeMachine struct {
 	root string
 	mu   sync.Mutex
 	ram  map[string][]byte // sandbox id -> memory; present means running
+	// diff snapshots: the base token each machine's memory derives from, the
+	// memory image at that base, and the image of the last snapshot taken
+	base     map[string]string
+	baseImg  map[string][]byte
+	lastSnap map[string][]byte
+	// Diffs counts diff snapshots taken, so tests can see them happen.
+	Diffs int
 }
+
+// fakeMemSize is the fake machine's memory image size: 16 pages.
+const fakeMemSize = 16 * 4096
 
 // NewFakeMachine keeps guest directories under root.
 func NewFakeMachine(root string) *FakeMachine {
-	return &FakeMachine{root: root, ram: map[string][]byte{}}
+	return &FakeMachine{root: root, ram: map[string][]byte{}, base: map[string]string{},
+		baseImg: map[string][]byte{}, lastSnap: map[string][]byte{}}
+}
+
+// memImage lays memory out as a fixed-size page image: an 8-byte length, then
+// the bytes, then zeros.
+func memImage(ram []byte) []byte {
+	img := make([]byte, fakeMemSize)
+	n := len(ram)
+	for i := 0; i < 8; i++ {
+		img[i] = byte(n >> (8 * i))
+	}
+	copy(img[8:], ram)
+	return img
+}
+
+func memFromImage(img []byte) []byte {
+	n := 0
+	for i := 0; i < 8; i++ {
+		n |= int(img[i]) << (8 * i)
+	}
+	return append([]byte(nil), img[8:8+n]...)
 }
 
 func (f *FakeMachine) Name() string           { return "fake-machine" }
@@ -49,6 +81,7 @@ func (f *FakeMachine) Boot(ctx context.Context, id, workDir string) error {
 		return err
 	}
 	f.ram[id] = []byte("boot;")
+	delete(f.base, id)
 	return nil
 }
 
@@ -96,27 +129,56 @@ func (f *FakeMachine) WriteTree(ctx context.Context, id string, t *tree.Tree, bl
 }
 
 // Snapshot writes memory, a state marker, and the guest directory as a disk.
-func (f *FakeMachine) Snapshot(ctx context.Context, id, dir string) (Image, error) {
+// When base matches the machine's recorded base, memory is written as a
+// sparse diff holding only the pages that changed since.
+func (f *FakeMachine) Snapshot(ctx context.Context, id, dir, base string) (Image, error) {
 	f.mu.Lock()
-	ram := append([]byte(nil), f.ram[id]...)
+	img := memImage(f.ram[id])
+	f.lastSnap[id] = img
+	diff := base != "" && f.base[id] == base && f.baseImg[id] != nil
+	prev := f.baseImg[id]
+	if diff {
+		f.Diffs++
+	}
 	f.mu.Unlock()
-	img := Image{Memory: filepath.Join(dir, "mem"), State: filepath.Join(dir, "state"), Disk: filepath.Join(dir, "disk")}
-	if err := os.WriteFile(img.Memory, ram, 0o600); err != nil {
+	out := Image{Memory: filepath.Join(dir, "mem"), State: filepath.Join(dir, "state"), Disk: filepath.Join(dir, "disk")}
+	if diff {
+		mf, err := os.Create(out.Memory)
+		if err != nil {
+			return Image{}, err
+		}
+		mf.Truncate(fakeMemSize)
+		for p := 0; p < fakeMemSize; p += 4096 {
+			if !bytes.Equal(img[p:p+4096], prev[p:p+4096]) {
+				mf.WriteAt(img[p:p+4096], int64(p))
+			}
+		}
+		mf.Close()
+		out.MemoryIsDiff, out.Base = true, base
+	} else if err := os.WriteFile(out.Memory, img, 0o600); err != nil {
 		return Image{}, err
 	}
-	if err := os.WriteFile(img.State, []byte("fake-vcpu-state"), 0o600); err != nil {
+	if err := os.WriteFile(out.State, []byte("fake-vcpu-state"), 0o600); err != nil {
 		return Image{}, err
 	}
 	disk, err := packDir(f.guest(id))
 	if err != nil {
 		return Image{}, err
 	}
-	return img, os.WriteFile(img.Disk, disk, 0o600)
+	return out, os.WriteFile(out.Disk, disk, 0o600)
+}
+
+// Rebase records that memory now equals the image of the last snapshot.
+func (f *FakeMachine) Rebase(ctx context.Context, id, base string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.base[id], f.baseImg[id] = base, f.lastSnap[id]
+	return nil
 }
 
 // Resume replaces the sandbox's machine with the image's memory and disk.
 func (f *FakeMachine) Resume(ctx context.Context, id, workDir string, img Image) error {
-	ram, err := os.ReadFile(img.Memory)
+	mem, err := os.ReadFile(img.Memory)
 	if err != nil {
 		return err
 	}
@@ -128,7 +190,8 @@ func (f *FakeMachine) Resume(ctx context.Context, id, workDir string, img Image)
 		return err
 	}
 	f.mu.Lock()
-	f.ram[id] = ram
+	f.ram[id] = memFromImage(mem)
+	f.base[id], f.baseImg[id] = img.Base, mem
 	f.mu.Unlock()
 	return nil
 }

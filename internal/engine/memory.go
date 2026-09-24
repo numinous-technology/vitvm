@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/numinous-technology/vitvm/internal/tree"
 )
@@ -50,21 +49,23 @@ func (e *Engine) bringUp(ctx context.Context, targetID string, c *Checkpoint, t 
 		return nil
 	}
 	if c.HasMemory() {
-		dir, err := os.MkdirTemp("", "vit-restore-")
-		if err != nil {
+		// images come from the repo's image cache, so resuming the same step
+		// again (or forking it many times) reassembles it only once
+		img := Image{Base: c.MemHash}
+		var err error
+		if img.Memory, err = e.cachedImage(c.MemHash, ".mem"); err != nil {
 			return err
 		}
-		defer os.RemoveAll(dir)
-		img := Image{Memory: filepath.Join(dir, "mem"), State: filepath.Join(dir, "state")}
-		if err := e.repo.CAS().GetChunkedTo(c.MemHash, img.Memory); err != nil {
-			return err
-		}
-		if err := e.writeBlobTo(c.StateHash, img.State); err != nil {
+		if img.State, err = e.cachedImage(c.StateHash, ".state"); err != nil {
 			return err
 		}
 		if c.DiskHash != "" {
-			img.Disk = filepath.Join(dir, "disk")
-			if err := e.repo.CAS().GetChunkedTo(c.DiskHash, img.Disk); err != nil {
+			if img.Disk, err = e.cachedImage(c.DiskHash, ".disk"); err != nil {
+				return err
+			}
+		}
+		if c.BaseHash != "" {
+			if img.BaseDisk, err = e.cachedImage(c.BaseHash, ".base"); err != nil {
 				return err
 			}
 		}
@@ -94,11 +95,25 @@ func (e *Engine) captureMachine(ctx context.Context, s *Sandbox, c *Checkpoint) 
 		return err
 	}
 	defer os.RemoveAll(dir)
-	img, err := mb.Snapshot(ctx, s.ID, dir)
+	base := ""
+	if s.Head != "" {
+		if head, err := e.repo.Checkpoint(s.Head); err == nil && head.HasMemory() {
+			base = head.MemHash
+		}
+	}
+	img, err := mb.Snapshot(ctx, s.ID, dir, base)
 	if err != nil {
 		return err
 	}
-	if c.MemHash, _, err = e.repo.CAS().PutChunked(img.Memory); err != nil {
+	if img.MemoryIsDiff {
+		if img.Base == "" {
+			img.Base = base
+		}
+		c.MemHash, _, err = e.repo.CAS().PutChunkedOverlay(img.Memory, img.Base)
+	} else {
+		c.MemHash, _, err = e.repo.CAS().PutChunked(img.Memory)
+	}
+	if err != nil {
 		return err
 	}
 	if c.StateHash, _, err = e.repo.CAS().PutFile(img.State); err != nil {
@@ -109,7 +124,12 @@ func (e *Engine) captureMachine(ctx context.Context, s *Sandbox, c *Checkpoint) 
 			return err
 		}
 	}
-	return nil
+	if img.BaseDisk != "" {
+		if c.BaseHash, err = e.baseHash(img.BaseDisk); err != nil {
+			return err
+		}
+	}
+	return mb.Rebase(ctx, s.ID, c.MemHash)
 }
 
 // guestTree reads the guest's working tree into a tree, fetching only file

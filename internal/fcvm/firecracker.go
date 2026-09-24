@@ -53,6 +53,13 @@ type Config struct {
 	MemMiB         int    // guest memory in MiB (default 512)
 	BootArgs       string // kernel command line
 	AgentTimeout   time.Duration
+	// DiskMode is "overlay" (default): the root filesystem is a shared
+	// read-only base with a small sparse writable disk layered over it in the
+	// guest, and only the writable disk is captured each step. "copy" gives
+	// each VM a full private copy of the root filesystem, for guest kernels
+	// without overlayfs.
+	DiskMode string
+	UpperGiB int // size of the sparse writable disk in overlay mode (default 8)
 }
 
 // Firecracker is a MemoryBackend and GuestFS backed by real microVMs.
@@ -80,6 +87,12 @@ func New(cfg Config) (*Firecracker, error) {
 	}
 	if cfg.RunDir == "" {
 		cfg.RunDir = filepath.Join(os.TempDir(), "vit-fc")
+	}
+	if cfg.DiskMode == "" {
+		cfg.DiskMode = "overlay"
+	}
+	if cfg.UpperGiB == 0 {
+		cfg.UpperGiB = 8
 	}
 	abs, err := filepath.Abs(cfg.RunDir)
 	if err != nil {
@@ -205,6 +218,31 @@ func (f *Firecracker) spawn(id string) error {
 	return fmt.Errorf("firecracker API socket never came up for %s (see %s)", id, f.LogPath(id))
 }
 
+// upperTemplate returns an empty, sparse ext4 image of UpperGiB, made once
+// per size and copied for each VM. Lazy inode-table and journal init keep it
+// sparse; the guest mounts it with noinit_itable so it stays that way.
+func (f *Firecracker) upperTemplate() (string, error) {
+	p := filepath.Join(f.cfg.RunDir, fmt.Sprintf("upper-%dg.ext4", f.cfg.UpperGiB))
+	if _, err := os.Stat(p); err == nil {
+		return p, nil
+	}
+	tmp, err := os.CreateTemp(f.cfg.RunDir, ".upper-*")
+	if err != nil {
+		return "", err
+	}
+	tmp.Close()
+	if err := os.Truncate(tmp.Name(), int64(f.cfg.UpperGiB)<<30); err != nil {
+		return "", err
+	}
+	out, err := exec.Command("mkfs.ext4", "-q", "-F", "-L", "vit-upper",
+		"-E", "lazy_itable_init=1,lazy_journal_init=1", tmp.Name()).CombinedOutput()
+	if err != nil {
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("making the writable disk: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return p, os.Rename(tmp.Name(), p)
+}
+
 // copyFile copies src to dst, sharing blocks with a reflink where the
 // filesystem supports it and keeping holes sparse.
 func copyFile(src, dst string) error {
@@ -228,22 +266,45 @@ func (f *Firecracker) Boot(ctx context.Context, id, workDir string) error {
 	if err := os.MkdirAll(d, 0o755); err != nil {
 		return err
 	}
-	if err := copyFile(f.cfg.RootFS, filepath.Join(d, "rootfs.ext4")); err != nil {
+	overlay := f.cfg.DiskMode == "overlay"
+	if overlay {
+		base, err := filepath.Abs(f.cfg.RootFS)
+		if err != nil {
+			return err
+		}
+		if err := os.Symlink(base, filepath.Join(d, "base.ext4")); err != nil {
+			return err
+		}
+		tmpl, err := f.upperTemplate()
+		if err != nil {
+			return err
+		}
+		if err := copyFile(tmpl, filepath.Join(d, "upper.ext4")); err != nil {
+			return err
+		}
+	} else if err := copyFile(f.cfg.RootFS, filepath.Join(d, "rootfs.ext4")); err != nil {
 		return err
 	}
 	if err := f.spawn(id); err != nil {
 		return err
 	}
-	steps := []struct {
+	type call struct {
 		method, path string
 		body         any
-	}{
-		{"PUT", "/boot-source", map[string]any{"kernel_image_path": f.cfg.KernelImage, "boot_args": f.cfg.BootArgs}},
-		{"PUT", "/drives/rootfs", map[string]any{"drive_id": "rootfs", "path_on_host": "rootfs.ext4", "is_root_device": true, "is_read_only": false}},
-		{"PUT", "/machine-config", map[string]any{"vcpu_count": f.cfg.VCPUs, "mem_size_mib": f.cfg.MemMiB}},
+	}
+	steps := []call{{"PUT", "/boot-source", map[string]any{"kernel_image_path": f.cfg.KernelImage, "boot_args": f.cfg.BootArgs}}}
+	if overlay {
+		steps = append(steps,
+			call{"PUT", "/drives/rootfs", map[string]any{"drive_id": "rootfs", "path_on_host": "base.ext4", "is_root_device": true, "is_read_only": true}},
+			call{"PUT", "/drives/upper", map[string]any{"drive_id": "upper", "path_on_host": "upper.ext4", "is_root_device": false, "is_read_only": false}})
+	} else {
+		steps = append(steps, call{"PUT", "/drives/rootfs", map[string]any{"drive_id": "rootfs", "path_on_host": "rootfs.ext4", "is_root_device": true, "is_read_only": false}})
+	}
+	steps = append(steps, []call{
+		{"PUT", "/machine-config", map[string]any{"vcpu_count": f.cfg.VCPUs, "mem_size_mib": f.cfg.MemMiB, "track_dirty_pages": true}},
 		{"PUT", "/vsock", map[string]any{"guest_cid": 3, "uds_path": "v.sock"}},
 		{"PUT", "/actions", map[string]any{"action_type": "InstanceStart"}},
-	}
+	}...)
 	for _, s := range steps {
 		if err := f.api(id, s.method, s.path, s.body); err != nil {
 			f.Shutdown(ctx, id)
@@ -253,9 +314,19 @@ func (f *Firecracker) Boot(ctx context.Context, id, workDir string) error {
 	return f.waitAgent(id)
 }
 
-// Snapshot pauses the VM, writes a full snapshot and a copy of its disk taken
-// while paused, and resumes it.
-func (f *Firecracker) Snapshot(ctx context.Context, id, dir string) (img engine.Image, err error) {
+func (f *Firecracker) baseFile(id string) string { return filepath.Join(f.dir(id), "base") }
+
+// Rebase records the stored image the VM's memory now equals, so the next
+// snapshot can be a diff against it.
+func (f *Firecracker) Rebase(ctx context.Context, id, base string) error {
+	return os.WriteFile(f.baseFile(id), []byte(base), 0o644)
+}
+
+// Snapshot pauses the VM, writes a snapshot and a copy of its disk taken while
+// paused, and resumes it. When base is the image this VM was last resumed from
+// or rebased onto, the memory is a diff: Firecracker writes only the pages
+// dirtied since, as a sparse file. Otherwise it writes all of memory.
+func (f *Firecracker) Snapshot(ctx context.Context, id, dir, base string) (img engine.Image, err error) {
 	if !f.Running(ctx, id) {
 		return img, fmt.Errorf("sandbox %s is not running", id)
 	}
@@ -264,6 +335,11 @@ func (f *Firecracker) Snapshot(ctx context.Context, id, dir string) (img engine.
 		return img, err
 	}
 	img = engine.Image{Memory: filepath.Join(absDir, "mem"), State: filepath.Join(absDir, "state"), Disk: filepath.Join(absDir, "disk")}
+	recorded, _ := os.ReadFile(f.baseFile(id))
+	kind := "Full"
+	if base != "" && string(recorded) == base {
+		kind, img.MemoryIsDiff, img.Base = "Diff", true, base
+	}
 	if err := f.api(id, "PATCH", "/vm", map[string]any{"state": "Paused"}); err != nil {
 		return img, err
 	}
@@ -273,19 +349,24 @@ func (f *Firecracker) Snapshot(ctx context.Context, id, dir string) (img engine.
 		}
 	}()
 	if err := f.api(id, "PUT", "/snapshot/create", map[string]any{
-		"snapshot_type": "Full", "snapshot_path": img.State, "mem_file_path": img.Memory,
+		"snapshot_type": kind, "snapshot_path": img.State, "mem_file_path": img.Memory,
 	}); err != nil {
 		return img, err
 	}
-	if err := copyFile(filepath.Join(f.dir(id), "rootfs.ext4"), img.Disk); err != nil {
+	writable := filepath.Join(f.dir(id), "rootfs.ext4")
+	if base, err := os.Readlink(filepath.Join(f.dir(id), "base.ext4")); err == nil {
+		writable, img.BaseDisk = filepath.Join(f.dir(id), "upper.ext4"), base
+	}
+	if err := copyFile(writable, img.Disk); err != nil {
 		return img, err
 	}
 	return img, nil
 }
 
-// Resume replaces the sandbox's VM with one loaded from an image: the disk and
-// memory are copied into the VM's directory and Firecracker loads the snapshot
-// there and resumes it.
+// Resume replaces the sandbox's VM with one loaded from an image. The disk is
+// copied into the VM's directory (the VM writes to it); memory and state are
+// loaded in place, since Firecracker maps the memory file copy-on-write and
+// never modifies it, so any number of forks can share one cached image.
 func (f *Firecracker) Resume(ctx context.Context, id, workDir string, img engine.Image) error {
 	f.Shutdown(ctx, id)
 	d := f.dir(id)
@@ -296,39 +377,76 @@ func (f *Firecracker) Resume(ctx context.Context, id, workDir string, img engine
 	if img.Disk == "" {
 		return errors.New("a firecracker image needs its disk")
 	}
-	if err := copyFile(img.Disk, filepath.Join(d, "rootfs.ext4")); err != nil {
+	// lay the directory out the way the snapshot recorded it
+	if img.BaseDisk != "" {
+		base, err := filepath.Abs(img.BaseDisk)
+		if err != nil {
+			return err
+		}
+		if err := os.Symlink(base, filepath.Join(d, "base.ext4")); err != nil {
+			return err
+		}
+		if err := copyFile(img.Disk, filepath.Join(d, "upper.ext4")); err != nil {
+			return err
+		}
+	} else if err := copyFile(img.Disk, filepath.Join(d, "rootfs.ext4")); err != nil {
 		return err
 	}
-	if err := copyFile(img.Memory, filepath.Join(d, "mem")); err != nil {
+	mem, err := filepath.Abs(img.Memory)
+	if err != nil {
 		return err
 	}
-	if err := copyFile(img.State, filepath.Join(d, "state")); err != nil {
+	state, err := filepath.Abs(img.State)
+	if err != nil {
 		return err
 	}
 	if err := f.spawn(id); err != nil {
 		return err
 	}
-	if err := f.api(id, "PUT", "/snapshot/load", map[string]any{
-		"snapshot_path": filepath.Join(d, "state"),
-		"mem_backend":   map[string]any{"backend_type": "File", "backend_path": filepath.Join(d, "mem")},
-		"resume_vm":     true,
-	}); err != nil {
-		f.Shutdown(ctx, id)
+	load := map[string]any{
+		"snapshot_path":     state,
+		"mem_backend":       map[string]any{"backend_type": "File", "backend_path": mem},
+		"track_dirty_pages": true,
+		"resume_vm":         true,
+	}
+	if err := f.api(id, "PUT", "/snapshot/load", load); err != nil {
+		if !strings.Contains(err.Error(), "track_dirty_pages") {
+			f.Shutdown(ctx, id)
+			return err
+		}
+		// older Firecracker names the flag enable_diff_snapshots
+		delete(load, "track_dirty_pages")
+		load["enable_diff_snapshots"] = true
+		f.kill(id)
+		if err := f.spawn(id); err != nil {
+			return err
+		}
+		if err := f.api(id, "PUT", "/snapshot/load", load); err != nil {
+			f.Shutdown(ctx, id)
+			return err
+		}
+	}
+	if err := f.Rebase(ctx, id, img.Base); err != nil {
 		return err
 	}
 	return f.waitAgent(id)
 }
 
-// Shutdown kills the sandbox's VM and removes its directory. Its state lives
-// in checkpoints, not here.
-func (f *Firecracker) Shutdown(ctx context.Context, id string) error {
-	if f.Running(ctx, id) {
+// kill stops the sandbox's Firecracker process, leaving its directory.
+func (f *Firecracker) kill(id string) {
+	if f.Running(context.Background(), id) {
 		p := f.pid(id)
 		syscall.Kill(p, syscall.SIGKILL)
 		for i := 0; i < 200 && alive(p); i++ {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
+}
+
+// Shutdown kills the sandbox's VM and removes its directory. Its state lives
+// in checkpoints, not here.
+func (f *Firecracker) Shutdown(ctx context.Context, id string) error {
+	f.kill(id)
 	os.RemoveAll(f.dir(id))
 	return nil
 }

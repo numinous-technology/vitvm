@@ -41,6 +41,7 @@ type Checkpoint struct {
 	MemHash   string `json:"mem_hash,omitempty"`
 	StateHash string `json:"state_hash,omitempty"`
 	DiskHash  string `json:"disk_hash,omitempty"`
+	BaseHash  string `json:"base_hash,omitempty"` // read-only base disk under DiskHash, if layered
 }
 
 // HasMemory reports whether the checkpoint carries a resumable machine image.

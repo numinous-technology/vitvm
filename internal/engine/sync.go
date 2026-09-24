@@ -66,7 +66,7 @@ func (e *Engine) pushCheckpoint(c *Checkpoint, store remote.ObjectStore, st *Pus
 	if c.StateHash != "" {
 		shas = append(shas, c.StateHash)
 	}
-	for _, h := range []string{c.MemHash, c.DiskHash} {
+	for _, h := range []string{c.MemHash, c.DiskHash, c.BaseHash} {
 		if h == "" {
 			continue
 		}
@@ -147,7 +147,7 @@ func (e *Engine) Pull(store remote.ObjectStore, checkpointID string) (*Checkpoin
 			return nil, err
 		}
 	}
-	for _, h := range []string{c.MemHash, c.DiskHash} {
+	for _, h := range []string{c.MemHash, c.DiskHash, c.BaseHash} {
 		if h == "" {
 			continue
 		}

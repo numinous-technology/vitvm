@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/numinous-technology/vitvm/internal/engine"
@@ -65,8 +66,11 @@ func TestBootUsesRelativeDevicePathsInTheVMDirectory(t *testing.T) {
 	log := calls(t, f, "vm1")
 	for _, want := range []string{
 		"cwd=" + f.dir("vm1") + " PUT /boot-source",
-		`"path_on_host":"rootfs.ext4"`, // relative: a fork opens its own disk
-		`"uds_path":"v.sock"`,          // relative: a fork gets its own socket
+		// overlay mode: a shared read-only base and this VM's writable disk,
+		// both by relative path, so a fork opens its own
+		`"drive_id":"rootfs","is_read_only":true,"is_root_device":true,"path_on_host":"base.ext4"`,
+		`"drive_id":"upper","is_read_only":false,"is_root_device":false,"path_on_host":"upper.ext4"`,
+		`"uds_path":"v.sock"`, // relative: a fork gets its own socket
 		`"vcpu_count":2`, `"mem_size_mib":256`,
 		"PUT /actions", "InstanceStart",
 	} {
@@ -76,6 +80,36 @@ func TestBootUsesRelativeDevicePathsInTheVMDirectory(t *testing.T) {
 	}
 	if !f.Running(ctx, "vm1") {
 		t.Fatal("booted VM should be running")
+	}
+	if blocks(filepath.Join(f.dir("vm1"), "upper.ext4")) > 64<<20 {
+		t.Fatal("the 8 GiB writable disk should be sparse")
+	}
+}
+
+func blocks(path string) int64 {
+	var st syscall.Stat_t
+	syscall.Stat(path, &st)
+	return st.Blocks * 512
+}
+
+func TestCopyModeGivesEachVMAPrivateRootDisk(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "base.ext4")
+	os.WriteFile(base, []byte("{}"), 0o644)
+	f, err := New(Config{FirecrackerBin: fakeBin, KernelImage: "/k", RootFS: base, RunDir: t.TempDir(), DiskMode: "copy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := f.Boot(ctx, "c1", ""); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Shutdown(ctx, "c1")
+	if !strings.Contains(calls(t, f, "c1"), `"path_on_host":"rootfs.ext4"`) || strings.Contains(calls(t, f, "c1"), "upper.ext4") {
+		t.Fatalf("copy mode should use one private root disk:\n%s", calls(t, f, "c1"))
+	}
+	img, err := f.Snapshot(ctx, "c1", t.TempDir(), "")
+	if err != nil || img.BaseDisk != "" {
+		t.Fatalf("copy mode has no base disk: %+v %v", img, err)
 	}
 }
 
@@ -139,10 +173,14 @@ func TestSnapshotAndForkCarryMemoryAndDisk(t *testing.T) {
 	defer f.Shutdown(ctx, "orig")
 	sh(t, f, "orig", "echo at-snapshot > f")
 	nonce := sh(t, f, "orig", "cat ../ram")
-	img, err := f.Snapshot(ctx, "orig", t.TempDir())
+	img, err := f.Snapshot(ctx, "orig", t.TempDir(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
+	if img.MemoryIsDiff || !strings.Contains(calls(t, f, "orig"), `"snapshot_type":"Full"`) {
+		t.Fatal("a snapshot with no confirmed base must be full")
+	}
+	img.Base = "img-1"
 	log := calls(t, f, "orig")
 	iP := strings.Index(log, `PATCH /vm {"state":"Paused"}`)
 	iC := strings.Index(log, "PUT /snapshot/create")
@@ -163,6 +201,20 @@ func TestSnapshotAndForkCarryMemoryAndDisk(t *testing.T) {
 	}
 	if !strings.Contains(calls(t, f, "fork"), "cwd="+f.dir("fork")+" PUT /snapshot/load") {
 		t.Fatal("the fork must load in its own directory")
+	}
+	if !strings.Contains(calls(t, f, "fork"), `"track_dirty_pages":true`) {
+		t.Fatal("a resumed VM must track dirty pages so its next snapshot can be a diff")
+	}
+	// memory is loaded in place from the image, not copied
+	if !strings.Contains(calls(t, f, "fork"), img.Memory) {
+		t.Fatal("resume should map the image's memory file directly")
+	}
+	// the fork's base is the image it came from: a diff against it, a full
+	// snapshot against anything else
+	d1, _ := f.Snapshot(ctx, "fork", t.TempDir(), "img-1")
+	d2, _ := f.Snapshot(ctx, "fork", t.TempDir(), "something-else")
+	if !d1.MemoryIsDiff || d2.MemoryIsDiff {
+		t.Fatalf("diff against the recorded base: %v, against another: %v", d1.MemoryIsDiff, d2.MemoryIsDiff)
 	}
 	sh(t, f, "fork", "echo fork > f")
 	if got := sh(t, f, "orig", "cat f"); got != "after" {
@@ -203,13 +255,16 @@ func TestEngineThroughTheDriver(t *testing.T) {
 	}
 	c1, _ := run(s, "echo one > notes.txt")
 	_, nonce := run(s, "cat ../ram")
-	if !c1.HasMemory() || c1.DiskHash == "" {
-		t.Fatal("firecracker checkpoints carry memory and disk")
+	if !c1.HasMemory() || c1.DiskHash == "" || c1.BaseHash == "" {
+		t.Fatalf("firecracker checkpoints carry memory, the writable disk and the base: %+v", c1)
 	}
 	if b, _ := e.ReadFile(c1.ID, "notes.txt"); string(b) != "one\n" {
 		t.Fatalf("show: %q", b)
 	}
 	c3, _ := run(s, "echo two >> notes.txt")
+	if !strings.Contains(calls(t, f, s.ID), `"snapshot_type":"Diff"`) {
+		t.Fatal("steps after the first should take diff snapshots")
+	}
 	if ch, _ := e.Diff(c1.ID, c3.ID); len(ch) != 1 || ch[0].Kind != "modified" {
 		t.Fatalf("diff: %+v", ch)
 	}
