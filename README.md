@@ -1,9 +1,9 @@
 # vitvm
 
-git for virtual machines. Every command you run in a sandbox saves the whole
-machine: its memory, its running processes, its disk and its files. Read any
-past step, diff two steps, rewind, or fork a new machine that picks up exactly
-where a step left off.
+git for VM state. Every command saves the whole machine, memory and running
+processes included, in 72 ms, and any step forks back to life in about 100 ms.
+Read any past step, diff two steps, rewind, or fork a new machine that picks up
+exactly where a step left off.
 
 A fork doesn't replay anything. The processes that were running at that step
 are still running.
