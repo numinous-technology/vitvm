@@ -48,6 +48,10 @@ func main() {
 		err = cmdShow(args)
 	case "fork":
 		err = cmdFork(args)
+	case "push":
+		err = cmdPush(args)
+	case "pull":
+		err = cmdPull(args)
 	case "version":
 		fmt.Println("vit", version)
 	case "-h", "--help", "help":
@@ -76,6 +80,11 @@ func usage() {
   vit diff CK [CK2]              what changed at a checkpoint, or between two
   vit show CHECKPOINT PATH       print a file as it was at a checkpoint
   vit fork CHECKPOINT [name]     branch a new sandbox from any checkpoint
+  vit push [sandbox] --to URL    upload a sandbox's checkpoints to a remote
+  vit pull CHECKPOINT --from URL pull a checkpoint and fork it locally
+
+remote URL: s3://bucket/prefix (S3 or S3-compatible; credentials from the
+environment), dir:///path, or a filesystem path. See docs/remotes.md.
 `)
 }
 

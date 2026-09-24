@@ -74,10 +74,33 @@ vit checkout CHECKPOINT     rewind the current sandbox to a checkpoint
 vit diff CK [CK2]           what changed at a checkpoint, or between two
 vit show CHECKPOINT PATH    print a file as it was at a checkpoint
 vit fork CHECKPOINT [name]  branch a new sandbox from any checkpoint
+vit push [sandbox] --to URL  upload a sandbox's checkpoints to a remote
+vit pull CHECKPOINT --from URL  pull a checkpoint and fork it locally
 ```
 
 A repo lives in `.vit` in the current directory (like `.git`). Set `VIT_DIR`
 to point elsewhere.
+
+## Remote checkpoint stores
+
+Checkpoints persist to any S3-compatible object store, so a sandbox's history
+outlives the machine it ran on and another machine can pull a checkpoint and
+fork from it. Pushing is incremental: because everything is content addressed,
+a blob already in the bucket is never uploaded twice.
+
+```bash
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-east-1
+vit push agent --to s3://my-bucket/checkpoints
+
+# on another machine
+vit pull ck-2c52a0bf6a14 --from s3://my-bucket/checkpoints
+```
+
+It works with AWS S3, MinIO, Cloudflare R2, Backblaze B2 and Ceph. Point
+`AWS_ENDPOINT_URL` at the service and set `VIT_S3_PATH_STYLE=1` where the
+service needs path-style addressing. A `dir:///path` remote (a shared
+filesystem or a mounted bucket) works too. Details in
+[docs/remotes.md](docs/remotes.md).
 
 ## Try it
 
@@ -98,17 +121,25 @@ There is a fuller walkthrough in [examples/fork-from-step](examples/fork-from-st
 
 - [docs/how-it-works.md](docs/how-it-works.md): the store, trees, the
   checkpoint chain, and what each command does.
+- [docs/remotes.md](docs/remotes.md): pushing and pulling checkpoints to S3 and
+  S3-compatible stores.
 - [docs/firecracker.md](docs/firecracker.md): the memory-checkpoint backend and
   what a KVM host needs to run it.
 
-## Status
+## What works
 
-Early. The process backend, the content-addressed store,
-the checkpoint chain, and run, log, checkout, diff, show and fork all work and
-are tested. The firecracker backend that adds live memory is documented and
-being brought up; its interface is in the tree. vitvm grew out of a production
-runtime that checkpointed agent microVMs at every tool call; this is that idea,
-rebuilt in the open, files first.
+The process backend, the content-addressed store, the checkpoint chain, remote
+push and pull to S3-compatible storage, and every command (run, log, checkout,
+diff, show, fork, push, pull) are built and covered by tests, including a full
+push to object storage and pull-and-fork on a fresh repo. vitvm has no external
+dependencies; the S3 client and its request signing are standard library.
+
+The firecracker backend adds a running machine's memory to each checkpoint, so
+a restore or a fork resumes a live process rather than replaying from files. It
+is the runtime vitvm was extracted from. Its interface is in the tree and
+[docs/firecracker.md](docs/firecracker.md) describes what a KVM host needs; the
+process backend, which checkpoints files, is what ships in this build and runs
+on any machine.
 
 ## License
 
