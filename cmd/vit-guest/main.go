@@ -50,6 +50,9 @@ func initMain() {
 	}
 	os.MkdirAll(work, 0o755)
 	syscall.Sethostname([]byte("vit"))
+	if err := loopbackUp(); err != nil {
+		fmt.Fprintln(os.Stderr, "vit-guest:", err)
+	}
 	for {
 		child := exec.Command("/proc/self/exe")
 		child.Env = append(os.Environ(), "VIT_AGENT_CHILD=1")
