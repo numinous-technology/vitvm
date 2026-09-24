@@ -1,66 +1,100 @@
 # The Firecracker backend
 
 The process backend checkpoints files. The Firecracker backend checkpoints a
-running machine: it boots a sandbox as a Firecracker microVM and snapshots the
-guest's memory and device state, so a restore or a fork resumes a live process
-at the point it was paused rather than replaying from files.
+running machine: each sandbox is a Firecracker microVM, and each step records
+the machine's memory, device state and root disk at one instant along with its
+files. A checkout or a fork resumes the machine exactly where that step left
+it, with its processes still running.
 
-It implements `engine.MemoryBackend` and speaks Firecracker's REST API over
-each VM's unix socket using only the standard library.
+## A step
 
-## What it does
+1. If the sandbox's machine is not running, it is brought back from the head
+   checkpoint: resumed from its image, or, for a checkpoint without one, booted
+   fresh with the checkpoint's files written in.
+2. The command runs inside the guest through the vitvm agent.
+3. The engine reads the guest's `/work` tree through the agent. Files carry a
+   hash computed in the guest, so only contents the store lacks cross over.
+4. The machine is paused, Firecracker writes a full snapshot (memory and device
+   state), the disk is copied while still paused, and the machine resumes.
+5. Memory and disk are stored as 1 MiB content-addressed chunks with a small
+   manifest each; the device state is a plain blob. The checkpoint records the
+   tree and the three image hashes.
 
-- **Boot** launches a firecracker process, configures the boot source, root
-  drive, machine size and a vsock device, and starts the guest.
-- **Exec** runs a command inside the guest through a small in-guest agent
-  (`cmd/vit-guest`) over vsock, and streams the output back.
-- **Snapshot** pauses the VM, writes a full snapshot (a memory image plus the
-  device state), and resumes it. The engine stores both as content-addressed
-  blobs, so unchanged memory pages across steps are stored once, the same way
-  unchanged files are.
-- **Restore** resumes the sandbox from a snapshot. **Fork** resumes a copy of a
-  snapshot as a new sandbox, so two machines diverge from the same live point.
+Because the disk is captured at the same instant as memory, a resumed machine
+never sees a filesystem that moved on without it.
 
-## Verified on real hardware
+## Fork and checkout
 
-The backend was run on a Linux KVM host (an EC2 `c5.metal`) with Firecracker
-v1.17 and a 6.1 guest kernel. The transcript is in
-[evidence/firecracker-real-kvm.txt](evidence/firecracker-real-kvm.txt):
+A checkpoint with an image resumes warm: the disk, memory and state are
+reassembled from their chunks into the target sandbox's own directory, a new
+Firecracker loads the snapshot there, and the guest carries on. Two forks of
+one step are two independent machines from the same instant.
 
-- A microVM boots and runs commands in the guest (`uname -r` returns the guest
-  kernel `6.1.102`, not the host's, and a file written in the guest reads back).
-- A 256 MiB memory snapshot is taken, then forked twice. Both forks resume the
-  original's in-RAM nonce and continue its counter from the snapshot point. A
-  cold boot generates a new random nonce, so a matching nonce across forks is
-  proof the live memory was restored, not rebooted.
+Each VM runs in its own directory, and the disk and vsock paths given to
+Firecracker are relative (`rootfs.ext4`, `v.sock`). A snapshot records those
+names, so a fork loaded in its own directory opens its own disk and socket, and
+never the original's.
 
-Two layers of tests cover it without a hypervisor:
+## Machines between commands
 
-- `internal/fcvm` tests the driver's exact REST sequence (boot, the
-  pause/create/resume order of a snapshot, and load-and-resume on a fork)
-  against a stand-in firecracker binary.
-- `internal/engine` tests the memory-checkpoint chain (capture at each step,
-  restore on checkout, fork resuming the right step's memory) against a fake
-  memory backend using real snapshot files.
+Firecracker runs detached from `vit`, so a machine outlives the command that
+started it, and the driver keeps no state of its own: every `vit` command finds
+a sandbox's machine from its directory under `firecracker.run_dir` (default
+`/tmp/vit-fc`).
 
-## What a host needs
+```
+/tmp/vit-fc/<sandbox>/api.sock     Firecracker's API socket
+/tmp/vit-fc/<sandbox>/v.sock       vsock socket to the guest agent
+/tmp/vit-fc/<sandbox>/rootfs.ext4  this VM's disk
+/tmp/vit-fc/<sandbox>/pid, fc.log  process id; console and Firecracker log
+```
 
-- Linux with KVM (`/dev/kvm`): a bare-metal instance or a nested-virtualisation
-  VM.
-- The `firecracker` binary, an uncompressed guest kernel, and a root filesystem
-  image that runs the in-guest agent.
-- A filesystem that supports reflinks (XFS or Btrfs) for cheap disk clones when
-  forking disk state.
+`vit stop` kills the machine and removes its directory; everything that matters
+is in its checkpoints, and the next `vit run` resumes the head checkpoint.
 
-None of this is needed for the process backend, which checkpoints files and
-runs on any machine.
+## The guest agent
 
-## Remaining integration
+`cmd/vit-guest` is the guest's init. As PID 1 it mounts `/proc`, `/sys`, `/dev`,
+`/dev/shm`, `/dev/pts` and `/run`, starts itself again as the agent, and reaps
+every orphaned process, so background processes a sandbox starts do not pile
+up. The agent listens on vsock port 1024 and serves one request per connection
+(`internal/agent`): `exec`, `tree`, `read`, `write`, `clear` and `ping`.
 
-The backend snapshots the guest's memory and its own root filesystem. Unifying
-that with the engine's file tree through `vit run`, so a single checkpoint holds
-both the host-visible working tree and the guest memory, needs the working
-directory shared into the guest (virtio-fs or a shared drive). Until then, the
-Firecracker backend checkpoints the machine (memory and its disk) and the
-process backend checkpoints the working tree; both use the same content-
-addressed store and the same `vit` commands.
+## Setting up a host
+
+- Linux with KVM (`/dev/kvm`): a bare-metal instance or a VM with nested
+  virtualisation. `vit` needs access to `/dev/kvm`.
+- `scripts/fetch-firecracker.sh DIR` downloads the Firecracker binary, a guest
+  kernel and an Ubuntu base image from the Firecracker project.
+- `sudo scripts/build-rootfs.sh BASE OUT [SIZE_MB]` installs the agent as init
+  into a base image and writes an ext4 root filesystem.
+- Point vit at them:
+
+```bash
+vit config firecracker.bin    /opt/fc/firecracker
+vit config firecracker.kernel /opt/fc/vmlinux
+vit config firecracker.rootfs /opt/fc/rootfs.ext4
+vit config firecracker.mem_mib 512      # optional, default 512
+vit config firecracker.vcpus 2          # optional, default 1
+```
+
+On a filesystem with reflinks (XFS, Btrfs), copying a disk image shares blocks
+and is nearly free; elsewhere it is a sparse copy.
+
+## Cost of a step
+
+On an EC2 `c5.metal` with a 512 MiB guest and a 1 GiB disk, a step takes about
+5 seconds, most of it writing and hashing the memory snapshot and the disk
+copy, and a warm fork about 1.7 seconds. Storage grows only by the chunks a
+step changed: 11 checkpoints that would be 16.9 GB stored whole took 532 MB.
+The end-to-end transcript is in
+[evidence/firecracker-cli-e2e.txt](evidence/firecracker-cli-e2e.txt).
+
+## Testing without KVM
+
+`internal/fcvm` is tested against `testdata/fakefc`, a stand-in `firecracker`
+that serves the same REST calls from the VM's directory and runs the real guest
+agent behind Firecracker's vsock handshake, keeping the guest's files inside its
+"disk" and a boot nonce in its "memory". The tests cover the boot sequence and
+relative device paths, a VM found again by a new driver, guest files, snapshot
+order, fork isolation, shutdown, and the engine end to end through the driver.

@@ -9,6 +9,10 @@ Content-addressed: you hand it bytes, it returns their sha256 and stores them
 once. Two files with the same contents, anywhere in any sandbox at any step,
 are one object on disk. Large files are streamed, not held in memory.
 
+Machine images (a VM's memory and disk) are stored chunked: split into 1 MiB
+pieces, each a blob, plus a manifest listing them. A step that changes a few
+pages of memory adds a few chunks, and all-zero regions are one chunk.
+
 ## Trees (`internal/tree`)
 
 A tree is a sorted list of a directory's entries: for each path, its mode,
@@ -26,35 +30,34 @@ what `vit checkout` and `vit fork` use.
 
 ## The checkpoint chain (`internal/engine`)
 
-A checkpoint records the sandbox it belongs to, its step number, its parent
-checkpoint, the hash of its tree, the command that produced it, the exit code,
-and the change counts. A sandbox points at its head checkpoint. Walking parents
-from the head gives the history.
-
-Because a checkpoint is just a tree hash plus a parent pointer, and trees and
-files are shared blobs, keeping every step is cheap: a step that changes one
-file adds one small blob and one small tree.
+A checkpoint records its sandbox, step number, parent, the hash of its tree,
+the command and exit code, and the change counts. On the firecracker backend it
+also records the manifests of the machine's memory and disk and the hash of its
+device state. A sandbox points at its head checkpoint; walking parents from
+the head gives the history.
 
 ## The engine
 
-- **run**: execute the command in the sandbox's working directory through the
-  backend, then snapshot the directory into a new checkpoint on top of the
-  head. Every step leaves a checkpoint.
-- **show / read**: resolve a path in a checkpoint's tree to a blob and return
-  it. No sandbox is booted and nothing re-runs.
-- **diff**: diff two checkpoints' trees.
-- **checkout**: restore the working directory to a checkpoint and move the head
-  there, so later steps build on that point.
-- **fork**: create a new sandbox whose working directory starts as a
-  checkpoint's exact state, from any sandbox, sharing all unchanged blobs. The
-  fork records where it came from and diverges without touching the original.
+- **run**: execute the command through the backend, then checkpoint on top of
+  the head. The tree comes from the host working directory on the process
+  backend and from the guest's `/work` on the firecracker backend; a
+  firecracker step also snapshots the machine. A firecracker sandbox whose
+  machine is not running is first brought back from its head checkpoint.
+- **show / diff**: resolve a checkpoint's tree from the store. No machine is
+  booted and nothing re-runs, whatever the backend.
+- **checkout**: move the head back to a checkpoint. Files are restored; a
+  machine resumes from the checkpoint's image, or has the checkpoint's files
+  written into it when there is no image.
+- **fork**: a new sandbox starting at a checkpoint from any sandbox, warm from
+  an image or cold from files, sharing every unchanged blob and chunk.
+- **stop**: shut a sandbox's machine down; its history is untouched.
 
 ## Backends
 
-The engine talks to a `Backend` that runs a command in a working directory. The
-process backend runs it as a local child. A firecracker backend runs it in a
-microVM and additionally snapshots memory; the engine and every command are
-unchanged, the checkpoint just carries more. See
+The engine drives a `Backend` that runs a command. A `GuestFS` backend also
+lists, reads and writes the sandbox's files inside the machine, and a
+`MemoryBackend` boots, snapshots and resumes the machine. The process backend is
+just a `Backend`; the firecracker backend is all three. See
 [firecracker.md](firecracker.md).
 
 ## On-disk layout

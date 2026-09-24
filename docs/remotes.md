@@ -64,6 +64,5 @@ vit pull ck-... --from /mnt/shared/vit-checkpoints
 - Pull writes into the local repo without creating a sandbox, then `vit pull`
   forks the checkpoint so you have a working sandbox to run. To pull without
   forking, use the library `Engine.Pull`.
-- The remote holds files, not the firecracker memory image. When the memory
-  backend lands, its memory blobs are content addressed the same way and ride
-  the same push and pull.
+- Firecracker checkpoints push their memory and disk manifests and every chunk
+  the bucket does not already have, so a pulled checkpoint forks warm.

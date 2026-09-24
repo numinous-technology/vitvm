@@ -64,28 +64,18 @@ func firstEnv(keys ...string) string {
 func cmdPush(args []string) error {
 	fs := parseFlags(args)
 	to := fs.str("to")
-	if to == "" && len(fs.rest) > 1 {
-		to = fs.rest[1]
-	}
 	if to == "" {
-		return fmt.Errorf("usage: vit push [sandbox] --to s3://bucket/prefix")
+		return fmt.Errorf("usage: vit push [SANDBOX] --to s3://bucket/prefix")
 	}
-	e, root, err := openEngine()
-	if err != nil {
-		return err
-	}
-	id := currentSandbox(root)
+	id := ""
 	if len(fs.rest) > 0 {
 		id = fs.rest[0]
 	}
-	if id == "" {
-		return fmt.Errorf("no sandbox given and none is current")
-	}
-	store, err := parseRemote(to)
+	e, s, _, err := sandboxEngine(id)
 	if err != nil {
 		return err
 	}
-	s, err := e.Repo().Sandbox(id)
+	store, err := parseRemote(to)
 	if err != nil {
 		return err
 	}
@@ -101,17 +91,10 @@ func cmdPush(args []string) error {
 func cmdPull(args []string) error {
 	fs := parseFlags(args)
 	from := fs.str("from")
-	if len(fs.rest) < 1 {
-		return fmt.Errorf("usage: vit pull CHECKPOINT --from s3://bucket/prefix [name]")
+	if len(fs.rest) < 1 || from == "" {
+		return fmt.Errorf("usage: vit pull CHECKPOINT --from s3://bucket/prefix [--as NAME] [--backend B]")
 	}
-	ckpt := fs.rest[0]
-	if from == "" && len(fs.rest) > 1 {
-		from = fs.rest[1]
-	}
-	if from == "" {
-		return fmt.Errorf("a --from remote is required")
-	}
-	e, root, err := openEngine()
+	repo, root, cfg, err := openRepo()
 	if err != nil {
 		return err
 	}
@@ -119,18 +102,24 @@ func cmdPull(args []string) error {
 	if err != nil {
 		return err
 	}
-	c, err := e.Pull(store, ckpt)
+	backend := fs.str("backend")
+	if backend == "" {
+		backend = cfg.get("backend")
+	}
+	e, err := engineFor(repo, cfg, backend)
+	if err != nil {
+		return err
+	}
+	c, err := e.Pull(store, fs.rest[0])
 	if err != nil {
 		return err
 	}
 	fmt.Printf("pulled checkpoint %s\n", c.ID)
-	// fork it into a usable sandbox so it can be run
-	name := fs.str("as")
-	fork, err := e.Fork(c.ID, name)
+	fork, err := e.Fork(c.ID, fs.str("as"))
 	if err != nil {
 		return err
 	}
 	setCurrent(root, fork.ID)
-	fmt.Printf("forked into sandbox %s (%s), now current\n", fork.Name, fork.ID)
+	fmt.Printf("forked into sandbox %s (%s) on %s, now current\n", fork.Name, fork.ID, fork.Backend)
 	return nil
 }

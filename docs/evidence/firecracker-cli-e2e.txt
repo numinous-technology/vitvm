@@ -1,0 +1,71 @@
+vitvm end to end through the vit CLI on a real KVM host: EC2 c5.metal, Ubuntu 22.04
+host kernel, Firecracker v1.17.0, guest kernel 6.1.102, 512 MiB guest, 1 GiB root disk.
+Script: docs/evidence/e2e.sh. 2026-09-24.
+
+##### host: 6.8.0-1063-aws, 96 cpus, /dev/kvm present
+##### scripts/fetch-firecracker.sh
+kernel vmlinux-6.1.102, image ubuntu-22.04.squashfs
+firecracker v1.17.0, kernel, and base image in /opt/fc
+##### scripts/build-rootfs.sh
+built /opt/fc/rootfs.ext4 (1024 MiB) with the vitvm agent as init
+##### a sandbox, steps
+created sandbox agent (sbx-68f570dc5961) on firecracker, now current
+6.1.102
+
+[ck-cb3531bacf35 step 1] exit 0, +1 +machine
+  step 1 took 6848 ms (boot + step + checkpoint)
+PASS  commands run in the guest kernel, not the host's
+counter started
+  step 3 read the counter: 37 (step took 4969 ms)
+  step 4 read the counter: 84
+PASS  a background process keeps running between steps
+sandbox agent (sbx-68f570dc5961) on firecracker
+* ck-4a7bbd460439  step 4   exit 0   ~1 +machine  sh -c cat /dev/shm/count; echo more >> notes.txt
+  ck-53521fdde403  step 3   exit 0   no file changes +machine  cat /dev/shm/count
+  ck-67b183ed7f54  step 2   exit 0   no file changes +machine  sh -c nohup sh -c "i=0; while :; do i=\$((i+1)); echo \$i > /dev/shm/count; sleep 0.2; done" >/dev/null 2>&1 & echo counter started
+  ck-cb3531bacf35  step 1   exit 0   +1 +machine  sh -c uname -r; echo hello > notes.txt
+  ck-4da2de33441a  step 0            no file changes  (created)
+PASS  every firecracker step carries a machine image
+##### show and diff read checkpoints without a machine
+PASS  show step 3's notes.txt
+~ notes.txt
+PASS  diff step 3 to 4 shows the modified file
+##### warm fork from step 3
+forked ck-53521fdde403 into sandbox retry (sbx-34c46cbfac55) on firecracker, warm, the machine resumed from that step; now current
+  fork took 1680 ms
+38
+43
+hello
+
+[ck-c5ade3b9d2f5 step 1] exit 0, no file changes +machine
+PASS  the fork's counter resumed from step 3, not from zero and not from step 4
+PASS  the fork's background process is alive and counting
+PASS  the fork's disk is step 3's (no 'more')
+##### a fresh sandbox has no such process
+PASS  a cold sandbox has no counter
+##### checkout rewinds the machine
+checked out ck-53521fdde403; machine resumed from that step
+38
+hello
+
+[ck-4362dc05686f step 6] exit 0, no file changes +machine
+PASS  after checkout the counter is back near step 3 (was 176)
+PASS  after checkout the disk is step 3's
+##### stop, then run resumes from the head
+stopped agent; the next run resumes from ck-bf1df13c2d9f
+*  sbx-68f570dc5961  agent  firecracker  stopped  7      -                2026-09-24T18:13:33Z
+PASS  stop shuts the machine down
+PASS  run after stop resumed the head's machine (counter 61 >= 60, still counting)
+##### push, then pull and warm-fork on another repo
+pushed agent to /root/remote: 7 checkpoints, 445 blobs uploaded, 8802 already there
+pulled checkpoint ck-53521fdde403
+forked into sandbox pulled (sbx-9d7464a55d32) on firecracker, now current
+38
+hello
+
+[ck-9dd9f69943ba step 1] exit 0, no file changes +machine
+PASS  a pulled checkpoint forks warm on another repo
+##### storage
+  11 machine checkpoints; stored whole they would be 16896 MiB; the repo holds 532 MiB
+PASS  chunked images dedupe (repo < 25% of whole images)
+##### result: 15 passed, 0 failed

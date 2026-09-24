@@ -1,9 +1,10 @@
-// Command vit is git for virtual machines: it runs sandboxes that checkpoint
-// at every step, and lets you log, diff, read, rewind and fork any past step.
+// Command vit is git for virtual machines: sandboxes that checkpoint at every
+// step, so you can log, diff, read, rewind and fork any past step.
 //
-// This build ships the process backend, which checkpoints a sandbox's files
-// after each command on any machine, with no hypervisor. The firecracker
-// backend (docs/firecracker.md) adds live memory to a checkpoint.
+// Two backends. process runs each step as a local process and checkpoints the
+// sandbox's files; it runs anywhere. firecracker runs the sandbox as a
+// Firecracker microVM and checkpoints its files, memory and disk, so a fork
+// resumes a live machine. Every command works the same on both.
 package main
 
 import (
@@ -18,7 +19,7 @@ import (
 	"github.com/numinous-technology/vitvm/internal/engine"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -26,42 +27,25 @@ func main() {
 		os.Exit(2)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
-	var err error
-	switch cmd {
-	case "init":
-		err = cmdInit(args)
-	case "new":
-		err = cmdNew(args)
-	case "run":
-		err = cmdRun(args)
-	case "log":
-		err = cmdLog(args)
-	case "ls":
-		err = cmdLs()
-	case "status":
-		err = cmdStatus()
-	case "checkout":
-		err = cmdCheckout(args)
-	case "diff":
-		err = cmdDiff(args)
-	case "show":
-		err = cmdShow(args)
-	case "fork":
-		err = cmdFork(args)
-	case "push":
-		err = cmdPush(args)
-	case "pull":
-		err = cmdPull(args)
-	case "version":
+	run := map[string]func([]string) error{
+		"init": cmdInit, "config": cmdConfig, "new": cmdNew, "run": cmdRun, "log": cmdLog,
+		"ls": func([]string) error { return cmdLs() }, "status": func([]string) error { return cmdStatus() },
+		"checkout": cmdCheckout, "diff": cmdDiff, "show": cmdShow, "fork": cmdFork,
+		"stop": cmdStop, "use": cmdUse, "push": cmdPush, "pull": cmdPull,
+	}
+	switch {
+	case cmd == "version":
 		fmt.Println("vit", version)
-	case "-h", "--help", "help":
+		return
+	case cmd == "-h" || cmd == "--help" || cmd == "help":
 		usage()
-	default:
+		return
+	case run[cmd] == nil:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", cmd)
 		usage()
 		os.Exit(2)
 	}
-	if err != nil {
+	if err := run[cmd](args); err != nil {
 		fmt.Fprintln(os.Stderr, "vit: "+err.Error())
 		os.Exit(1)
 	}
@@ -70,21 +54,25 @@ func main() {
 func usage() {
 	fmt.Print(`vit: git for virtual machines. Sandboxes that checkpoint at every step.
 
-  vit init                       create a repo in the current directory
-  vit new [name]                 start a sandbox and make it current
-  vit run -- CMD...              run a command; the result is a checkpoint
-  vit log [sandbox]              the checkpoints of a sandbox, newest first
-  vit ls                         list sandboxes
-  vit status                     the current sandbox and where its head is
-  vit checkout CHECKPOINT        rewind the current sandbox to a checkpoint
-  vit diff CK [CK2]              what changed at a checkpoint, or between two
-  vit show CHECKPOINT PATH       print a file as it was at a checkpoint
-  vit fork CHECKPOINT [name]     branch a new sandbox from any checkpoint
-  vit push [sandbox] --to URL    upload a sandbox's checkpoints to a remote
-  vit pull CHECKPOINT --from URL pull a checkpoint and fork it locally
+  vit init                         create a repo (.vit) in the current directory
+  vit config [KEY [VALUE]]         show or set configuration
+  vit new [NAME] [--backend B]     start a sandbox (process or firecracker)
+  vit run -- CMD...                run a command; the result is a checkpoint
+  vit log [SANDBOX]                the checkpoints of a sandbox, newest first
+  vit ls                           list sandboxes
+  vit status                       the current sandbox and its head
+  vit use SANDBOX                  make a sandbox current
+  vit checkout CHECKPOINT          rewind the current sandbox to a checkpoint
+  vit diff CK [CK2]                what changed at a checkpoint, or between two
+  vit show CHECKPOINT PATH         print a file as it was at a checkpoint
+  vit fork CHECKPOINT [NAME]       branch a new sandbox from any checkpoint
+  vit stop [SANDBOX]               shut a sandbox's machine down (history kept)
+  vit push [SANDBOX] --to URL      upload a sandbox's checkpoints to a remote
+  vit pull CHECKPOINT --from URL   pull a checkpoint and fork it here
 
-remote URL: s3://bucket/prefix (S3 or S3-compatible; credentials from the
-environment), dir:///path, or a filesystem path. See docs/remotes.md.
+On the firecracker backend a checkpoint holds the machine's memory and disk as
+well as its files: fork and checkout resume the live machine. Remotes are
+s3://bucket/prefix, dir:///path or a path. See docs/.
 `)
 }
 
@@ -108,16 +96,47 @@ func repoDir() (string, error) {
 	}
 }
 
-func openEngine() (*engine.Engine, string, error) {
+func openRepo() (*engine.Repo, string, *config, error) {
 	root, err := repoDir()
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	repo, err := engine.OpenRepo(root)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
-	return engine.New(repo, engine.ProcessBackend{}), root, nil
+	cfg, err := loadConfig(root)
+	return repo, root, cfg, err
+}
+
+// engineFor builds an engine over the repo with the named backend.
+func engineFor(repo *engine.Repo, cfg *config, backend string) (*engine.Engine, error) {
+	b, err := cfg.backend(backend)
+	if err != nil {
+		return nil, err
+	}
+	return engine.New(repo, b), nil
+}
+
+// sandboxEngine loads a sandbox (the current one when id is "") and an engine
+// with the backend it was created with.
+func sandboxEngine(id string) (*engine.Engine, *engine.Sandbox, string, error) {
+	repo, root, cfg, err := openRepo()
+	if err != nil {
+		return nil, nil, "", err
+	}
+	if id == "" {
+		id = currentSandbox(root)
+	}
+	if id == "" {
+		return nil, nil, root, fmt.Errorf("no current sandbox (run `vit new`)")
+	}
+	s, err := repo.Sandbox(id)
+	if err != nil {
+		return nil, nil, root, err
+	}
+	e, err := engineFor(repo, cfg, s.Backend)
+	return e, s, root, err
 }
 
 func currentSandbox(root string) string {
@@ -140,19 +159,28 @@ func cmdInit(args []string) error {
 	if _, err := engine.OpenRepo(root); err != nil {
 		return err
 	}
-	abs, _ := filepath.Abs(root)
-	fmt.Printf("initialised a vit repo at %s\n", abs)
+	a, _ := filepath.Abs(root)
+	fmt.Printf("initialised a vit repo at %s\n", a)
 	return nil
 }
 
 func cmdNew(args []string) error {
-	e, root, err := openEngine()
+	fs := parseFlags(args)
+	repo, root, cfg, err := openRepo()
+	if err != nil {
+		return err
+	}
+	backend := fs.str("backend")
+	if backend == "" {
+		backend = cfg.get("backend")
+	}
+	e, err := engineFor(repo, cfg, backend)
 	if err != nil {
 		return err
 	}
 	name := ""
-	if len(args) > 0 {
-		name = args[0]
+	if len(fs.rest) > 0 {
+		name = fs.rest[0]
 	}
 	s, err := e.Create(name)
 	if err != nil {
@@ -161,32 +189,18 @@ func cmdNew(args []string) error {
 	if err := setCurrent(root, s.ID); err != nil {
 		return err
 	}
-	fmt.Printf("created sandbox %s (%s), now current\n", s.Name, s.ID)
-	fmt.Printf("its files live in %s\n", e.Repo().WorkDir(s.ID))
+	fmt.Printf("created sandbox %s (%s) on %s, now current\n", s.Name, s.ID, s.Backend)
 	return nil
 }
 
 func cmdRun(args []string) error {
-	if len(args) == 0 || args[0] != "--" {
-		// allow: vit run -- cmd, or vit run cmd
-		if len(args) > 0 && args[0] == "--" {
-			args = args[1:]
-		}
-	} else {
+	if len(args) > 0 && args[0] == "--" {
 		args = args[1:]
 	}
 	if len(args) == 0 {
 		return fmt.Errorf("a command is required: vit run -- CMD...")
 	}
-	e, root, err := openEngine()
-	if err != nil {
-		return err
-	}
-	cur := currentSandbox(root)
-	if cur == "" {
-		return fmt.Errorf("no current sandbox (run `vit new`)")
-	}
-	s, err := e.Repo().Sandbox(cur)
+	e, s, _, err := sandboxEngine("")
 	if err != nil {
 		return err
 	}
@@ -194,23 +208,16 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("\n[%s step %d] exit %d, %s\n", c.ID, c.Seq, c.ExitCode, changeSummary(c))
+	fmt.Printf("\n[%s step %d] exit %d, %s%s\n", c.ID, c.Seq, c.ExitCode, changeSummary(c), machineTag(c))
 	return nil
 }
 
 func cmdLog(args []string) error {
-	e, root, err := openEngine()
-	if err != nil {
-		return err
-	}
-	id := currentSandbox(root)
+	id := ""
 	if len(args) > 0 {
 		id = args[0]
 	}
-	if id == "" {
-		return fmt.Errorf("no sandbox given and none is current")
-	}
-	s, err := e.Repo().Sandbox(id)
+	e, s, _, err := sandboxEngine(id)
 	if err != nil {
 		return err
 	}
@@ -218,7 +225,7 @@ func cmdLog(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("sandbox %s (%s)", s.Name, s.ID)
+	fmt.Printf("sandbox %s (%s) on %s", s.Name, s.ID, s.Backend)
 	if s.ForkedFrom != "" {
 		fmt.Printf(", forked from %s", s.ForkedFrom)
 	}
@@ -228,49 +235,57 @@ func cmdLog(args []string) error {
 		if c.ID == s.Head {
 			marker = "* "
 		}
-		fmt.Printf("%s%s  step %-3d %-8s %s  %s\n", marker, c.ID, c.Seq,
-			exitLabel(c), changeSummary(c), commandOrNote(c))
+		fmt.Printf("%s%s  step %-3d %-8s %s%s  %s\n", marker, c.ID, c.Seq, exitLabel(c), changeSummary(c), machineTag(c), commandOrNote(c))
 	}
 	return nil
 }
 
 func cmdLs() error {
-	e, root, err := openEngine()
+	repo, root, cfg, err := openRepo()
 	if err != nil {
 		return err
 	}
 	cur := currentSandbox(root)
 	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "\tID\tNAME\tBACKEND\tSTEPS\tFORKED FROM\tCREATED")
-	for _, s := range e.Repo().Sandboxes() {
+	fmt.Fprintln(tw, "\tID\tNAME\tBACKEND\tMACHINE\tSTEPS\tFORKED FROM\tCREATED")
+	for _, s := range repo.Sandboxes() {
 		mark := " "
 		if s.ID == cur {
 			mark = "*"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n", mark, s.ID, s.Name, s.Backend, s.Steps,
-			dash(s.ForkedFrom), s.Created.Format(time.RFC3339))
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n", mark, s.ID, s.Name, s.Backend, machineState(cfg, s),
+			s.Steps, dash(s.ForkedFrom), s.Created.Format(time.RFC3339))
 	}
-	tw.Flush()
-	return nil
+	return tw.Flush()
+}
+
+func machineState(cfg *config, s *engine.Sandbox) string {
+	b, err := cfg.backend(s.Backend)
+	if err != nil {
+		return "?"
+	}
+	mb, ok := b.(engine.MemoryBackend)
+	if !ok {
+		return "-"
+	}
+	if mb.Running(context.Background(), s.ID) {
+		return "running"
+	}
+	return "stopped"
 }
 
 func cmdStatus() error {
-	e, root, err := openEngine()
+	e, s, _, err := sandboxEngine("")
 	if err != nil {
-		return err
-	}
-	cur := currentSandbox(root)
-	if cur == "" {
-		fmt.Println("no current sandbox (run `vit new`)")
+		fmt.Println(err)
 		return nil
 	}
-	s, err := e.Repo().Sandbox(cur)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("on sandbox %s (%s)\n", s.Name, s.ID)
+	_, _, cfg, _ := openRepo()
+	fmt.Printf("on sandbox %s (%s), backend %s, machine %s\n", s.Name, s.ID, s.Backend, machineState(cfg, s))
 	fmt.Printf("head %s, %d step(s)\n", s.Head, s.Steps)
-	fmt.Printf("files in %s\n", e.Repo().WorkDir(s.ID))
+	if s.Backend == "process" || s.Backend == "" {
+		fmt.Printf("files in %s\n", e.Repo().WorkDir(s.ID))
+	}
 	return nil
 }
 
@@ -278,18 +293,19 @@ func cmdCheckout(args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: vit checkout CHECKPOINT")
 	}
-	e, root, err := openEngine()
-	if err != nil {
-		return err
-	}
-	s, err := e.Repo().Sandbox(currentSandbox(root))
+	e, s, _, err := sandboxEngine("")
 	if err != nil {
 		return err
 	}
 	if err := e.Checkout(s, args[0]); err != nil {
 		return err
 	}
-	fmt.Printf("checked out %s; working files restored to that step\n", args[0])
+	c, _ := e.Repo().Checkpoint(args[0])
+	how := "files restored"
+	if c != nil && c.HasMemory() {
+		how = "machine resumed from that step"
+	}
+	fmt.Printf("checked out %s; %s\n", args[0], how)
 	return nil
 }
 
@@ -297,18 +313,16 @@ func cmdDiff(args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: vit diff CK [CK2]")
 	}
-	e, _, err := openEngine()
+	repo, _, cfg, err := openRepo()
 	if err != nil {
 		return err
 	}
+	e, _ := engineFor(repo, cfg, "process")
 	from, to := "", args[0]
 	if len(args) >= 2 {
 		from, to = args[0], args[1]
-	} else {
-		// diff a checkpoint against its parent
-		if c, err := e.Repo().Checkpoint(args[0]); err == nil {
-			from = c.Parent
-		}
+	} else if c, err := repo.Checkpoint(args[0]); err == nil {
+		from = c.Parent
 	}
 	changes, err := e.Diff(from, to)
 	if err != nil {
@@ -329,10 +343,11 @@ func cmdShow(args []string) error {
 	if len(args) < 2 {
 		return fmt.Errorf("usage: vit show CHECKPOINT PATH")
 	}
-	e, _, err := openEngine()
+	repo, _, cfg, err := openRepo()
 	if err != nil {
 		return err
 	}
+	e, _ := engineFor(repo, cfg, "process")
 	b, err := e.ReadFile(args[0], args[1])
 	if err != nil {
 		return err
@@ -342,29 +357,92 @@ func cmdShow(args []string) error {
 }
 
 func cmdFork(args []string) error {
-	if len(args) < 1 {
-		return fmt.Errorf("usage: vit fork CHECKPOINT [name]")
+	fs := parseFlags(args)
+	if len(fs.rest) < 1 {
+		return fmt.Errorf("usage: vit fork CHECKPOINT [NAME] [--backend B]")
 	}
-	e, root, err := openEngine()
+	repo, root, cfg, err := openRepo()
+	if err != nil {
+		return err
+	}
+	src, err := repo.Checkpoint(fs.rest[0])
+	if err != nil {
+		return err
+	}
+	backend := fs.str("backend")
+	if backend == "" {
+		if s, err := repo.Sandbox(src.Sandbox); err == nil {
+			backend = s.Backend
+		} else {
+			backend = cfg.get("backend")
+		}
+	}
+	e, err := engineFor(repo, cfg, backend)
 	if err != nil {
 		return err
 	}
 	name := ""
-	if len(args) >= 2 {
-		name = args[1]
+	if len(fs.rest) >= 2 {
+		name = fs.rest[1]
 	}
-	s, err := e.Fork(args[0], name)
+	s, err := e.Fork(src.ID, name)
 	if err != nil {
 		return err
 	}
 	if err := setCurrent(root, s.ID); err != nil {
 		return err
 	}
-	fmt.Printf("forked %s into sandbox %s (%s), now current\n", args[0], s.Name, s.ID)
+	how := "cold, from its files"
+	if backend == "firecracker" && src.HasMemory() {
+		how = "warm, the machine resumed from that step"
+	}
+	fmt.Printf("forked %s into sandbox %s (%s) on %s, %s; now current\n", src.ID, s.Name, s.ID, backend, how)
+	return nil
+}
+
+func cmdStop(args []string) error {
+	id := ""
+	if len(args) > 0 {
+		id = args[0]
+	}
+	e, s, _, err := sandboxEngine(id)
+	if err != nil {
+		return err
+	}
+	if err := e.Stop(context.Background(), s); err != nil {
+		return err
+	}
+	fmt.Printf("stopped %s; the next run resumes from %s\n", s.Name, s.Head)
+	return nil
+}
+
+func cmdUse(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: vit use SANDBOX")
+	}
+	repo, root, _, err := openRepo()
+	if err != nil {
+		return err
+	}
+	s, err := repo.Sandbox(args[0])
+	if err != nil {
+		return err
+	}
+	if err := setCurrent(root, s.ID); err != nil {
+		return err
+	}
+	fmt.Printf("now on sandbox %s (%s)\n", s.Name, s.ID)
 	return nil
 }
 
 // helpers ------------------------------------------------------------------
+
+func machineTag(c *engine.Checkpoint) string {
+	if c.HasMemory() {
+		return " +machine"
+	}
+	return ""
+}
 
 func changeSummary(c *engine.Checkpoint) string {
 	if c.Added == 0 && c.Modified == 0 && c.Deleted == 0 {
