@@ -40,11 +40,38 @@ diffing a checkpoint is served from the store and never touches a machine.
 
 On the firecracker backend a checkpoint also holds the machine: its memory, its
 device state and its disk, captured at the same instant. Only what changed is
-written: Firecracker records the memory pages dirtied since the last step, and
-the root filesystem is a shared read-only base with a small writable layer, of
-which only the layer is captured. Both are stored as content-addressed chunks
-shared with earlier steps. On a real run, 11 checkpoints of a 512 MiB machine,
-which would be 16.9 GB stored whole, took 575 MB.
+written, and everything is stored as content-addressed chunks shared with
+earlier steps (see Speed below).
+
+## Speed
+
+Checkpointing a whole machine at every step is only useful if it is cheap. On
+an EC2 `c5.metal` with a 512 MiB guest:
+
+| | time |
+|---|---|
+| a small step, including its full machine checkpoint | 72 ms |
+| warm fork, first from a step | 109 ms |
+| warm fork, again from the same step | 37 ms |
+| first step of a new sandbox, including boot | 1.2 s |
+
+Four things make that possible:
+
+- **Only changed memory is written.** Firecracker tracks the pages the guest
+  dirtied since the last step, and only those are saved; the rest of the image
+  reuses the previous step's chunks without being read. If vitvm cannot
+  confirm which saved image a machine's memory came from, it saves all of
+  memory instead, so a mismatch costs time, never correctness.
+- **Only the writable disk is captured.** Every machine's root filesystem is
+  the same read-only base, stored once, with a small sparse writable disk
+  layered over it inside the guest. A step captures just that layer.
+- **Hashing is cheap.** Images are hashed on every core, and empty regions of
+  sparse files are never read.
+- **Forks share memory.** A step's memory image is rebuilt once into a local
+  cache, and every fork maps that one file copy-on-write instead of copying it.
+
+Storage grows by what each step changed, about 25 MB per small step here: 11
+checkpoints that would be 16.9 GB stored whole took 575 MB.
 
 ## Backends
 
@@ -130,7 +157,18 @@ vit pull CHECKPOINT --from URL   pull a checkpoint and fork it here
 
 A repo lives in `.vit` in the current directory, like `.git`; set `VIT_DIR` to
 point elsewhere. Every configuration key can also be set in the environment:
-`firecracker.kernel` is `VIT_FIRECRACKER_KERNEL`.
+`firecracker.kernel` is `VIT_FIRECRACKER_KERNEL`. `vit config` lists them all;
+the ones worth knowing:
+
+| key | meaning |
+|---|---|
+| `backend` | `process` (default) or `firecracker` for new sandboxes |
+| `firecracker.mem_mib`, `firecracker.vcpus` | guest size (default 512 MiB, 1 vCPU) |
+| `firecracker.disk_mode` | `overlay` (default: shared base + writable layer) or `copy` (a full private disk per machine, for guest kernels without overlayfs) |
+| `firecracker.upper_gib` | size of the sparse writable disk (default 8) |
+
+The local image cache that makes repeat forks fast lives in `.vit/cache` and is
+capped by `VIT_CACHE_GIB` (default 16).
 
 ## Remote checkpoint stores
 
@@ -163,16 +201,7 @@ guest kernel; a background process survives between steps; `show` and `diff`
 read machine checkpoints; a fork resumes the step's running process and its
 disk, not a later one; checkout rewinds the machine; stop and run resume it; a
 pushed checkpoint pulls and forks warm in another repo; chunked images dedupe;
-and the speed below.
-
-| on that host, 512 MiB guest | time |
-|---|---|
-| a small step, including its full machine checkpoint | 72 ms (median of 5) |
-| warm fork, first from a step | 109 ms |
-| warm fork, again from the same step | 37 ms |
-| first step of a new sandbox, including boot | 1.2 s |
-
-Transcript: [docs/evidence/firecracker-cli-e2e.txt](docs/evidence/firecracker-cli-e2e.txt).
+and the speed figures above. Transcript: [docs/evidence/firecracker-cli-e2e.txt](docs/evidence/firecracker-cli-e2e.txt).
 
 ## How it works
 
