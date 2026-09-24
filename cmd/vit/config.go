@@ -136,3 +136,16 @@ func cmdConfig(args []string) error {
 		return cfg.set(args[0], args[1])
 	}
 }
+
+// defaultBackend is what a new sandbox uses when none is asked for: the
+// configured backend, else a machine once Firecracker has a kernel and a root
+// filesystem, else the files-only process backend.
+func (c *config) defaultBackend() string {
+	if b := c.get("backend"); b != "" {
+		return b
+	}
+	if c.get("firecracker.kernel") != "" && c.get("firecracker.rootfs") != "" {
+		return "firecracker"
+	}
+	return "process"
+}

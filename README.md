@@ -1,14 +1,16 @@
 # vitvm
 
-git for virtual machines. A sandbox that checkpoints at every step, so you can
-log its history, read any past step, diff two steps, rewind, and fork a new
-sandbox from any point. On a KVM host a fork resumes the live machine, running
-processes and all.
+Continuous checkpoints of a whole machine. vitvm runs a sandbox as a microVM
+and saves it after every command: its memory and running processes, its disk,
+and its files, all at the same instant. Any past step can be read, diffed,
+rewound to, or forked into a new machine that carries on from exactly that
+point, with the same processes still running.
 
-The command is `vit`.
+git versions files. vitvm versions the machine the files live in. The command
+is `vit`.
 
 ```
-$ vit new agent --backend firecracker
+$ vit new agent
 $ vit run -- python agent.py --task fix-the-bug
 ...
 $ vit log
@@ -21,27 +23,59 @@ $ vit diff ck-5b30 ck-5c91          # what step 3 changed
 $ vit fork ck-5b30 retry            # a new machine, resumed exactly at step 2
 ```
 
-## Why
+## Why memory
 
-When a long agent run or a build goes wrong at step 40, you usually rerun the
-whole thing to see what happened at step 12. That is slow and it is not even
-the same run. vitvm keeps every step, so step 12 is still there: its files, its
-diff, and a fork you can restart from.
+Most of what makes a long run expensive is not in its files. A model loaded
+into a GPU or into RAM, a warmed cache, an interpreter with an agent's state in
+it, a database with data in memory, a server that took a minute to start, a
+debugger stopped at a breakpoint: none of it survives a restore from files. You
+restart, reinstall, reload and replay until you are back where you were, and
+the replay is not even the same run.
 
-It is version control applied to a running sandbox instead of a source tree.
-Each command leaves a checkpoint, and checkpoints share unchanged data, so
-keeping all of them is cheap.
+vitvm keeps every step of the live machine. When a run goes wrong at step 40,
+step 12 is still there, running. Fork it and try a different step 13, or fork
+it ten times and try ten, each starting warm in about 40 milliseconds instead
+of rebuilding from scratch.
 
 ## What a checkpoint is
 
-Every checkpoint holds the sandbox's files: a tree of content-addressed blobs,
-so a file that never changes across a hundred steps is stored once. Reading or
-diffing a checkpoint is served from the store and never touches a machine.
+Every checkpoint holds the machine: its memory, its device state and its disk,
+captured at one instant, so a checkout or a fork resumes exactly there. It also
+holds the machine's files as a tree, so reading or diffing any step is served
+from the store without booting anything.
 
-On the firecracker backend a checkpoint also holds the machine: its memory, its
-device state and its disk, captured at the same instant. Only what changed is
-written, and everything is stored as content-addressed chunks shared with
-earlier steps (see Speed below).
+Nothing is copied whole. A step writes only the memory pages the guest changed
+and only the writable part of its disk, and everything is stored as
+content-addressed chunks shared with every other step (see Speed below).
+
+## Machines, and a files-only mode
+
+Machine checkpoints need Linux with KVM (`/dev/kvm`), a bare-metal host or a VM
+with nested virtualisation. Everywhere else, vitvm has a files-only mode that
+runs each step as a local process and checkpoints the working directory.
+
+| | machine (firecracker) | files only (process) |
+|---|---|---|
+| where | Linux with `/dev/kvm` | any machine, no root |
+| a step runs | inside the sandbox's microVM | as a local process |
+| a checkpoint holds | memory, device state, disk, files | files |
+| fork and checkout | resume the live machine | restore the files |
+| `show`, `diff`, push, pull | yes | yes |
+
+The files-only mode is close to git with a commit after every command. It adds
+that the whole working directory is captured automatically, untracked files and
+large binaries included, that each snapshot is tied to the command and exit
+code that made it, and that any step can be forked. The machine checkpoints are
+the point; the files-only mode is there so the same workflow runs on a laptop.
+
+Once a Firecracker kernel and root filesystem are configured, new sandboxes are
+machines by default; `vit new --backend process` or `vit config backend` picks
+otherwise. A fork uses its source's mode unless told otherwise, and a
+checkpoint from either can be forked in the other: without a memory image, a
+machine fork boots fresh and writes the checkpoint's files into it.
+
+A machine keeps running between `vit` commands. `vit stop` shuts it down; the
+next `vit run` brings it back from its latest checkpoint, warm.
 
 ## Speed
 
@@ -73,25 +107,6 @@ Four things make that possible:
 Storage grows by what each step changed, about 25 MB per small step here: 11
 checkpoints that would be 16.9 GB stored whole took 575 MB.
 
-## Backends
-
-| | process | firecracker |
-|---|---|---|
-| where | any machine, no root | Linux with `/dev/kvm` |
-| a step runs | as a local process | inside the sandbox's microVM |
-| a checkpoint holds | files | files, memory, device state, disk |
-| fork and checkout | restore the files | resume the live machine |
-| `show`, `diff`, push, pull | yes | yes |
-
-Choose per sandbox with `vit new --backend`, or set a default with
-`vit config backend firecracker`. A fork uses its source's backend unless told
-otherwise, and a checkpoint from either backend can be forked on the other:
-without a memory image, a firecracker fork boots a fresh machine and writes the
-checkpoint's files into it.
-
-A firecracker machine keeps running between `vit` commands. `vit stop` shuts it
-down; the next `vit run` brings it back from its latest checkpoint, warm.
-
 ## Install
 
 ```bash
@@ -100,19 +115,7 @@ go build -o /usr/local/bin/vit ./cmd/vit
 
 vitvm has no dependencies outside the Go standard library.
 
-## Quick start: files, anywhere
-
-```bash
-cd "$(mktemp -d)"
-vit init
-vit new demo
-vit run -- sh -c 'echo hello > note.txt'
-vit run -- sh -c 'echo world >> note.txt'
-vit log
-vit show "$(vit log | grep 'step 1' | grep -o 'ck-[0-9a-f]*')" note.txt
-```
-
-## Quick start: live machines on KVM
+## Quick start
 
 ```bash
 # firecracker, a guest kernel, and an Ubuntu base image
@@ -121,7 +124,6 @@ scripts/fetch-firecracker.sh /opt/fc
 sudo scripts/build-rootfs.sh /opt/fc/base.squashfs /opt/fc/rootfs.ext4
 
 vit init
-vit config backend firecracker
 vit config firecracker.bin /opt/fc/firecracker
 vit config firecracker.kernel /opt/fc/vmlinux
 vit config firecracker.rootfs /opt/fc/rootfs.ext4
@@ -134,6 +136,18 @@ vit run -- cat /dev/shm/n        # the fork's counter carries on from step 2
 ```
 
 `vit` needs access to `/dev/kvm` (root, or membership of the `kvm` group).
+
+## Quick start: files only, on any machine
+
+```bash
+cd "$(mktemp -d)"
+vit init
+vit new demo
+vit run -- sh -c 'echo hello > note.txt'
+vit run -- sh -c 'echo world >> note.txt'
+vit log
+vit show "$(vit log | grep 'step 1' | grep -o 'ck-[0-9a-f]*')" note.txt
+```
 
 ## Commands
 
@@ -162,7 +176,7 @@ the ones worth knowing:
 
 | key | meaning |
 |---|---|
-| `backend` | `process` (default) or `firecracker` for new sandboxes |
+| `backend` | for new sandboxes: `firecracker` (the default once a kernel and rootfs are set) or `process` |
 | `firecracker.mem_mib`, `firecracker.vcpus` | guest size (default 512 MiB, 1 vCPU) |
 | `firecracker.disk_mode` | `overlay` (default: shared base + writable layer) or `copy` (a full private disk per machine, for guest kernels without overlayfs) |
 | `firecracker.upper_gib` | size of the sparse writable disk (default 8) |

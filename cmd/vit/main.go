@@ -172,7 +172,7 @@ func cmdNew(args []string) error {
 	}
 	backend := fs.str("backend")
 	if backend == "" {
-		backend = cfg.get("backend")
+		backend = cfg.defaultBackend()
 	}
 	e, err := engineFor(repo, cfg, backend)
 	if err != nil {
@@ -374,7 +374,7 @@ func cmdFork(args []string) error {
 		if s, err := repo.Sandbox(src.Sandbox); err == nil {
 			backend = s.Backend
 		} else {
-			backend = cfg.get("backend")
+			backend = cfg.defaultBackend()
 		}
 	}
 	e, err := engineFor(repo, cfg, backend)

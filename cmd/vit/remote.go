@@ -104,7 +104,7 @@ func cmdPull(args []string) error {
 	}
 	backend := fs.str("backend")
 	if backend == "" {
-		backend = cfg.get("backend")
+		backend = cfg.defaultBackend()
 	}
 	e, err := engineFor(repo, cfg, backend)
 	if err != nil {
