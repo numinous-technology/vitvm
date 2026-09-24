@@ -229,3 +229,34 @@ func TestStepsTakeDiffSnapshotsAndTheyReassemble(t *testing.T) {
 		t.Fatal("diff after checkout reassembled wrong")
 	}
 }
+
+type inFlightMachine struct {
+	*FakeMachine
+	jobs []string
+}
+
+func (m inFlightMachine) InFlight(ctx context.Context, id string) ([]string, error) {
+	return m.jobs, nil
+}
+
+func TestStepsSeeTheirSandboxAndStepAndWarnAboutGPUJobsInFlight(t *testing.T) {
+	repo, _ := OpenRepo(t.TempDir())
+	fm := inFlightMachine{NewFakeMachine(t.TempDir()), nil}
+	e := New(repo, fm)
+	s, _ := e.Create("vm")
+	var out, errb bytes.Buffer
+	e.Run(context.Background(), s, []string{"sh", "-c", "echo $VIT_SANDBOX $VIT_STEP"}, &out, &errb)
+	e.Run(context.Background(), s, []string{"sh", "-c", "echo $VIT_STEP"}, &out, &errb)
+	if got := strings.Fields(out.String()); len(got) != 3 || got[0] != s.ID || got[1] != "1" || got[2] != "2" {
+		t.Fatalf("steps saw %q, want the sandbox id and steps 1 and 2", out.String())
+	}
+	if errb.Len() != 0 {
+		t.Fatalf("no warning expected yet: %q", errb.String())
+	}
+	fm.jobs = []string{"gmux run --share 0.25 -- python train.py"}
+	e = New(repo, fm)
+	e.Run(context.Background(), s, []string{"true"}, &out, &errb)
+	if !strings.Contains(errb.String(), "1 gmux job(s) still running") || !strings.Contains(errb.String(), "train.py") {
+		t.Fatalf("expected an in-flight warning, got %q", errb.String())
+	}
+}

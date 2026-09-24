@@ -7,6 +7,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"syscall"
@@ -120,6 +121,7 @@ func overlayRoot() error {
 }
 
 func serve() {
+	agent.DialHost = func(port uint32) (io.ReadWriteCloser, error) { return dialVsock(port) }
 	ln, err := listenVsock(agent.Port)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "vit-guest: vsock:", err)

@@ -80,3 +80,10 @@ type MemoryBackend interface {
 	// Shutdown stops the sandbox's machine.
 	Shutdown(ctx context.Context, sandboxID string) error
 }
+
+// InFlightBackend reports work a sandbox started that runs outside the
+// machine and so cannot be checkpointed with it: gmux GPU jobs still running
+// in the background.
+type InFlightBackend interface {
+	InFlight(ctx context.Context, sandboxID string) ([]string, error)
+}

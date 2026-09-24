@@ -52,6 +52,12 @@ func main() {
 	}
 	cwd, _ := os.Getwd()
 	logf, _ := os.OpenFile("calls.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	// guest-to-host vsock, as Firecracker does it: port P reaches the unix
+	// socket <uds_path>_P in the VM's directory
+	agent.DialHost = func(port uint32) (io.ReadWriteCloser, error) {
+		return net.Dial("unix", filepath.Join(cwd, fmt.Sprintf("%s_%d", vsockName, port)))
+	}
+	agent.ConfigRoot = filepath.Join(cwd, "sysroot")
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
 		os.Exit(3)
@@ -110,10 +116,10 @@ func main() {
 	}))
 }
 
-var vsockPath string
+var vsockPath, vsockName string
 
 func serveVsock(path string) {
-	vsockPath = path
+	vsockPath, vsockName = path, path
 	os.Remove(path)
 	ln, err := net.Listen("unix", path)
 	if err != nil {

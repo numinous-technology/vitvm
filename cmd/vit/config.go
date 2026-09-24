@@ -26,6 +26,7 @@ var configKeys = map[string]string{
 	"firecracker.bootargs":  "guest kernel command line (default starts the vit agent)",
 	"firecracker.disk_mode": "overlay (default: shared read-only base + small writable disk) or copy",
 	"firecracker.upper_gib": "size of the sparse writable disk in overlay mode (default 8)",
+	"gmux.remotes":          "GPU hosts machines may use: NAME=TOKEN@HOST:PORT#FINGERPRINT,... (from gmux serve --addr)",
 }
 
 type config struct {
@@ -82,7 +83,14 @@ func (c *config) backend(name string) (engine.Backend, error) {
 	case "", "process":
 		return engine.ProcessBackend{}, nil
 	case "firecracker":
+		forwards, err := parseGmuxRemotes(c.get("gmux.remotes"))
+		if err != nil {
+			return nil, err
+		}
+		self, _ := os.Executable()
 		return fcvm.New(fcvm.Config{
+			Forwards:       forwards,
+			ForwarderBin:   self,
 			FirecrackerBin: c.get("firecracker.bin"),
 			KernelImage:    abs(c.get("firecracker.kernel")),
 			RootFS:         abs(c.get("firecracker.rootfs")),

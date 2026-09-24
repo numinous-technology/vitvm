@@ -60,6 +60,22 @@ type Config struct {
 	// without overlayfs.
 	DiskMode string
 	UpperGiB int // size of the sparse writable disk in overlay mode (default 8)
+
+	// Forwards are the only places a machine can reach: gmux GPU hosts. Each
+	// gets a guest port (GuestPortBase, +1, ...) on 127.0.0.1, tunnelled over
+	// vsock to a forwarder next to the VM that connects to Target. The guest's
+	// gmux config points at those ports.
+	Forwards      []Forward
+	GuestPortBase int    // default 7070
+	ForwarderBin  string // the vit binary, which runs the forwarders
+}
+
+// Forward is one gmux host a machine may use.
+type Forward struct {
+	Name        string // the name gmux knows it by inside the guest
+	Target      string // HOST:PORT the forwarder connects to
+	Token       string
+	Fingerprint string
 }
 
 // Firecracker is a MemoryBackend and GuestFS backed by real microVMs.
@@ -93,6 +109,9 @@ func New(cfg Config) (*Firecracker, error) {
 	}
 	if cfg.UpperGiB == 0 {
 		cfg.UpperGiB = 8
+	}
+	if cfg.GuestPortBase == 0 {
+		cfg.GuestPortBase = 7070
 	}
 	abs, err := filepath.Abs(cfg.RunDir)
 	if err != nil {
@@ -311,7 +330,10 @@ func (f *Firecracker) Boot(ctx context.Context, id, workDir string) error {
 			return err
 		}
 	}
-	return f.waitAgent(id)
+	if err := f.waitAgent(id); err != nil {
+		return err
+	}
+	return f.setupForwards(id)
 }
 
 func (f *Firecracker) baseFile(id string) string { return filepath.Join(f.dir(id), "base") }
@@ -429,11 +451,16 @@ func (f *Firecracker) Resume(ctx context.Context, id, workDir string, img engine
 	if err := f.Rebase(ctx, id, img.Base); err != nil {
 		return err
 	}
-	return f.waitAgent(id)
+	if err := f.waitAgent(id); err != nil {
+		return err
+	}
+	return f.setupForwards(id) // a fork needs its own forwarders
 }
 
-// kill stops the sandbox's Firecracker process, leaving its directory.
+// kill stops the sandbox's Firecracker process and its forwarders, leaving its
+// directory.
 func (f *Firecracker) kill(id string) {
+	f.killForwarders(id)
 	if f.Running(context.Background(), id) {
 		p := f.pid(id)
 		syscall.Kill(p, syscall.SIGKILL)

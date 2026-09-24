@@ -86,3 +86,25 @@ func (c *vsockConn) Write(p []byte) (int, error) {
 }
 
 func (c *vsockConn) Close() error { return syscall.Close(c.fd) }
+
+// vmaddrCIDHost is the host's vsock address as seen from a guest.
+const vmaddrCIDHost = 2
+
+// dialVsock connects to a vsock port on the host. Firecracker hands the
+// connection to the unix socket <uds_path>_<port> in the VM's directory.
+func dialVsock(port uint32) (*vsockConn, error) {
+	fd, err := syscall.Socket(afVSOCK, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return nil, fmt.Errorf("socket: %w", err)
+	}
+	var sa [sockaddrVM]byte
+	sa[0] = byte(afVSOCK)
+	sa[1] = byte(afVSOCK >> 8)
+	sa[4], sa[5], sa[6], sa[7] = byte(port), byte(port>>8), byte(port>>16), byte(port>>24)
+	sa[8] = vmaddrCIDHost
+	if _, _, e := syscall.Syscall(syscall.SYS_CONNECT, uintptr(fd), uintptr(unsafe.Pointer(&sa[0])), sockaddrVM); e != 0 {
+		syscall.Close(fd)
+		return nil, fmt.Errorf("connect vsock host:%d: %w", port, e)
+	}
+	return &vsockConn{fd: fd}, nil
+}

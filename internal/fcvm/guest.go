@@ -39,7 +39,13 @@ func (f *Firecracker) waitAgent(id string) error {
 
 // Exec runs a command in the guest's work tree.
 func (f *Firecracker) Exec(ctx context.Context, id, workDir string, command []string, env []string, stdout, stderr io.Writer) (int, error) {
-	r, _, err := f.call(id, agent.Request{Op: "exec", Cmd: command, Env: guestEnv(env)}, nil)
+	step := ""
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "VIT_STEP=") {
+			step = strings.TrimPrefix(kv, "VIT_STEP=")
+		}
+	}
+	r, _, err := f.call(id, agent.Request{Op: "exec", Cmd: command, Env: append(guestEnv(env), f.gmuxEnv(id, step)...)}, nil)
 	if err != nil {
 		return -1, err
 	}

@@ -12,6 +12,8 @@
 //	read  {path}                      -> {"size":n} + n bytes
 //	write {path, mode, size|link|dir} + bytes -> {"ok":true}
 //	clear                             -> {"ok":true}   (empties the work tree)
+//	forward {ports, config}           -> {"ok":true, "path"}  (see forward.go)
+//	jobs                              -> {"jobs":[...]}  (gmux runs in progress)
 package agent
 
 import (
@@ -52,6 +54,10 @@ type Request struct {
 	Size  int64    `json:"size,omitempty"`
 	Link  string   `json:"link,omitempty"`
 	IsDir bool     `json:"is_dir,omitempty"`
+	// forward: guest TCP ports to open on 127.0.0.1, each tunnelled to the host
+	// over vsock on the same port, and a gmux host config to install
+	Ports  []uint32 `json:"ports,omitempty"`
+	Config string   `json:"config,omitempty"`
 }
 
 // Reply is the header line of a reply.
@@ -63,6 +69,9 @@ type Reply struct {
 	Stderr  string  `json:"stderr,omitempty"`
 	Entries []Entry `json:"entries,omitempty"`
 	Size    int64   `json:"size,omitempty"`
+	// forward: where the gmux config was written; jobs: running gmux jobs
+	Path string   `json:"path,omitempty"`
+	Jobs []string `json:"jobs,omitempty"`
 }
 
 // Handle serves one request on rw against the work tree at root.
@@ -111,6 +120,15 @@ func Handle(rw io.ReadWriter, root string) {
 			return
 		}
 		reply(rw, Reply{OK: true})
+	case "forward":
+		path, err := forward(req)
+		if err != nil {
+			reply(rw, Reply{Error: err.Error()})
+			return
+		}
+		reply(rw, Reply{OK: true, Path: path})
+	case "jobs":
+		reply(rw, Reply{OK: true, Jobs: gmuxJobs()})
 	case "clear":
 		ents, _ := os.ReadDir(root)
 		for _, e := range ents {

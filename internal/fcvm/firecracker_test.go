@@ -1,12 +1,16 @@
 package fcvm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -15,12 +19,17 @@ import (
 	"github.com/numinous-technology/vitvm/internal/tree"
 )
 
-var fakeBin string
+var fakeBin, vitBin string
 
 func TestMain(m *testing.M) {
 	dir, _ := os.MkdirTemp("", "fakefc")
 	fakeBin = filepath.Join(dir, "fakefc")
 	if out, err := exec.Command("go", "build", "-o", fakeBin, "./testdata/fakefc").CombinedOutput(); err != nil {
+		os.Stderr.Write(out)
+		os.Exit(1)
+	}
+	vitBin = filepath.Join(dir, "vit") // the forwarder
+	if out, err := exec.Command("go", "build", "-o", vitBin, "../../cmd/vit").CombinedOutput(); err != nil {
 		os.Stderr.Write(out)
 		os.Exit(1)
 	}
@@ -281,5 +290,84 @@ func TestEngineThroughTheDriver(t *testing.T) {
 	}
 	if _, got := run(s, "cat ../ram; echo; cat notes.txt"); got != nonce+"\none\ntwo" {
 		t.Fatalf("after stop, run resumed %q", got)
+	}
+}
+
+// A stand-in gmux host: greets, then echoes a line.
+func gmuxHost(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				c.Write([]byte("gpu-host\n"))
+				line, _ := bufio.NewReader(c).ReadString('\n')
+				c.Write([]byte("echo " + line))
+			}(c)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func freePort(t *testing.T) int {
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+func TestAMachineReachesItsGmuxHostsThroughTheTunnel(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "base.ext4")
+	os.WriteFile(base, []byte("{}"), 0o644)
+	gport := freePort(t)
+	f, err := New(Config{FirecrackerBin: fakeBin, KernelImage: "/k", RootFS: base, RunDir: t.TempDir(),
+		Forwards:      []Forward{{Name: "gpu1", Target: gmuxHost(t), Token: "tok", Fingerprint: "ff"}},
+		GuestPortBase: gport, ForwarderBin: vitBin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := f.Boot(ctx, "g1", ""); err != nil {
+		t.Fatal(err)
+	}
+	pids, _ := os.ReadFile(filepath.Join(f.dir("g1"), "forward.pids"))
+	// guest command -> guest port -> vsock -> forwarder -> the gmux host
+	script := fmt.Sprintf(`import socket
+s=socket.create_connection(("127.0.0.1",%d)); f=s.makefile("rw")
+print(f.readline().strip()); f.write("ping\n"); f.flush(); print(f.readline().strip())`, gport)
+	var out, errb bytes.Buffer
+	if code, err := f.Exec(ctx, "g1", "", []string{"python3", "-c", script}, nil, &out, &errb); err != nil || code != 0 {
+		t.Fatalf("exec: %d %v %s", code, err, errb.String())
+	}
+	if out.String() != "gpu-host\necho ping\n" {
+		t.Fatalf("through the tunnel: %q", out.String())
+	}
+	// the sandbox's gmux settings
+	out.Reset()
+	f.Exec(ctx, "g1", "", []string{"sh", "-c", `echo "$GMUX_SESSION_PREFIX|$GMUX_OWNER|$GMUX_NAME"; cat "$GMUX_CONFIG"`}, []string{"VIT_STEP=3"}, &out, &errb)
+	lines := strings.SplitN(out.String(), "\n", 2)
+	if lines[0] != "g1|vit-g1|vit-g1-step3" {
+		t.Fatalf("gmux env: %q", lines[0])
+	}
+	if !strings.Contains(lines[1], fmt.Sprintf(`"gpu1":"tok@127.0.0.1:%d#ff"`, gport)) || !strings.Contains(lines[1], `"default":"gpu1"`) {
+		t.Fatalf("guest gmux config: %q", lines[1])
+	}
+	if _, err := f.InFlight(ctx, "g1"); err != nil {
+		t.Fatal(err)
+	}
+	f.Shutdown(ctx, "g1")
+	for _, p := range strings.Fields(string(pids)) {
+		n, _ := strconv.Atoi(p)
+		if alive(n) {
+			t.Fatal("the forwarder must stop with the machine")
+		}
 	}
 }

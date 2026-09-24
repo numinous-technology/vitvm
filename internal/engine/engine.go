@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,9 +55,20 @@ func (e *Engine) Run(ctx context.Context, s *Sandbox, command []string, stdout, 
 	if err := e.ensureMachine(ctx, s); err != nil {
 		return nil, err
 	}
-	code, err := e.backend.Exec(ctx, s.ID, e.repo.WorkDir(s.ID), command, os.Environ(), stdout, stderr)
+	env := append(os.Environ(), "VIT_SANDBOX="+s.ID, "VIT_STEP="+strconv.Itoa(s.Steps+1))
+	code, err := e.backend.Exec(ctx, s.ID, e.repo.WorkDir(s.ID), command, env, stdout, stderr)
 	if err != nil {
 		return nil, err
+	}
+	// A gmux job left running in the background is not part of this step: its
+	// remote end cannot be forked with the machine. Say so.
+	if ib, ok := e.backend.(InFlightBackend); ok {
+		if jobs, err := ib.InFlight(ctx, s.ID); err == nil && len(jobs) > 0 {
+			fmt.Fprintf(stderr, "vit: %d gmux job(s) still running as this step is saved; a fork of this step will not carry them:\n", len(jobs))
+			for _, j := range jobs {
+				fmt.Fprintf(stderr, "  %s\n", j)
+			}
+		}
 	}
 	s.Steps++
 	c, err := e.checkpoint(ctx, s, command, code, "")

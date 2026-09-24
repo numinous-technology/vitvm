@@ -7,7 +7,9 @@
 # userland (scripts/fetch-firecracker.sh downloads an Ubuntu one). The script
 # installs the vitvm guest agent as the VM's init and writes an ext4 image to
 # OUT. Needs root (for loop mounts and to keep file ownership), and the agent
-# binary at $VIT_GUEST (default: build it from this repo).
+# binary at $VIT_GUEST (default: build it from this repo). With $GMUX_BIN set
+# to a gmux binary, it is installed too, so machines can run jobs on the gmux
+# GPU hosts in `vit config gmux.remotes`.
 set -euo pipefail
 BASE=$1; OUT=$2; SIZE=${3:-1024}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -25,6 +27,7 @@ case "$BASE" in
 esac
 install -m 0755 "$AGENT" "$ROOT/usr/bin/vit-guest"
 ln -sf /usr/bin/vit-guest "$ROOT/sbin/vit-init"
+if [ -n "${GMUX_BIN:-}" ]; then install -m 0755 "$GMUX_BIN" "$ROOT/usr/local/bin/gmux"; fi
 mkdir -p "$ROOT/work" "$ROOT/mnt"  # /mnt: scratch space for the overlay root
 rm -f "$OUT"
 truncate -s "${SIZE}M" "$OUT"

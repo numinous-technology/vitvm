@@ -32,6 +32,7 @@ func main() {
 		"ls": func([]string) error { return cmdLs() }, "status": func([]string) error { return cmdStatus() },
 		"checkout": cmdCheckout, "diff": cmdDiff, "show": cmdShow, "fork": cmdFork,
 		"stop": cmdStop, "use": cmdUse, "push": cmdPush, "pull": cmdPull,
+		"__forward": cmdForward, // internal: the forwarder next to a machine
 	}
 	switch {
 	case cmd == "version":
