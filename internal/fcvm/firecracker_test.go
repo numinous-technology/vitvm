@@ -1,106 +1,230 @@
 package fcvm
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/numinous-technology/vitvm/internal/engine"
+	"github.com/numinous-technology/vitvm/internal/tree"
 )
 
-// buildFakeFC compiles the stand-in firecracker binary once.
-func buildFakeFC(t *testing.T) string {
-	t.Helper()
-	bin := filepath.Join(t.TempDir(), "fakefc")
-	out, err := exec.Command("go", "build", "-o", bin, "./testdata/fakefc").CombinedOutput()
-	if err != nil {
-		t.Fatalf("building fakefc: %v\n%s", err, out)
+var fakeBin string
+
+func TestMain(m *testing.M) {
+	dir, _ := os.MkdirTemp("", "fakefc")
+	fakeBin = filepath.Join(dir, "fakefc")
+	if out, err := exec.Command("go", "build", "-o", fakeBin, "./testdata/fakefc").CombinedOutput(); err != nil {
+		os.Stderr.Write(out)
+		os.Exit(1)
 	}
-	return bin
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
 }
 
-func newDriver(t *testing.T) (*Firecracker, string) {
+func driver(t *testing.T, run string) *Firecracker {
 	t.Helper()
-	run := t.TempDir()
-	f, err := New(Config{FirecrackerBin: buildFakeFC(t), KernelImage: "/k/vmlinux",
-		RootFS: "/k/rootfs.ext4", RunDir: run, VCPUs: 2, MemMiB: 256})
+	base := filepath.Join(t.TempDir(), "base.ext4")
+	os.WriteFile(base, []byte("{}"), 0o644)
+	f, err := New(Config{FirecrackerBin: fakeBin, KernelImage: "/k/vmlinux", RootFS: base, RunDir: run, VCPUs: 2, MemMiB: 256})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return f, run
+	return f
 }
 
-func calls(t *testing.T, run, id string) string {
+func sh(t *testing.T, f *Firecracker, id, script string) string {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join(run, id+".sock.calls"))
-	if err != nil {
-		t.Fatalf("no call log for %s: %v", id, err)
+	var out, errb bytes.Buffer
+	code, err := f.Exec(context.Background(), id, "", []string{"sh", "-c", script}, nil, &out, &errb)
+	if err != nil || code != 0 {
+		t.Fatalf("exec %q in %s: code=%d err=%v stderr=%s", script, id, code, err, errb.String())
 	}
+	return strings.TrimSpace(out.String())
+}
+
+func calls(t *testing.T, f *Firecracker, id string) string {
+	t.Helper()
+	b, _ := os.ReadFile(filepath.Join(f.dir(id), "calls.log"))
 	return string(b)
 }
 
-func TestBootSendsTheRightSequence(t *testing.T) {
-	f, run := newDriver(t)
-	if err := f.Boot(context.Background(), "vm1", t.TempDir()); err != nil {
+func TestBootUsesRelativeDevicePathsInTheVMDirectory(t *testing.T) {
+	f := driver(t, t.TempDir())
+	ctx := context.Background()
+	if err := f.Boot(ctx, "vm1", ""); err != nil {
 		t.Fatal(err)
 	}
-	defer f.Shutdown(context.Background(), "vm1")
-	log := calls(t, run, "vm1")
+	defer f.Shutdown(ctx, "vm1")
+	log := calls(t, f, "vm1")
 	for _, want := range []string{
-		"PUT /boot-source", "kernel_image_path", "/k/vmlinux",
-		"PUT /drives/rootfs", "is_root_device", "/k/rootfs.ext4",
-		"PUT /machine-config", "vcpu_count", "mem_size_mib",
-		"PUT /vsock", "guest_cid",
+		"cwd=" + f.dir("vm1") + " PUT /boot-source",
+		`"path_on_host":"rootfs.ext4"`, // relative: a fork opens its own disk
+		`"uds_path":"v.sock"`,          // relative: a fork gets its own socket
+		`"vcpu_count":2`, `"mem_size_mib":256`,
 		"PUT /actions", "InstanceStart",
 	} {
 		if !strings.Contains(log, want) {
-			t.Fatalf("boot did not send %q; calls were:\n%s", want, log)
+			t.Fatalf("boot is missing %q:\n%s", want, log)
 		}
+	}
+	if !f.Running(ctx, "vm1") {
+		t.Fatal("booted VM should be running")
 	}
 }
 
-func TestSnapshotPausesCreatesResumesAndWritesFiles(t *testing.T) {
-	f, run := newDriver(t)
+func TestAVMOutlivesTheDriverThatStartedIt(t *testing.T) {
+	run := t.TempDir()
 	ctx := context.Background()
-	if err := f.Boot(ctx, "vm2", t.TempDir()); err != nil {
+	first := driver(t, run)
+	if err := first.Boot(ctx, "vm2", ""); err != nil {
 		t.Fatal(err)
 	}
-	defer f.Shutdown(ctx, "vm2")
-	dir := t.TempDir()
-	memPath, statePath, err := f.Snapshot(ctx, "vm2", dir)
+	sh(t, first, "vm2", "echo persisted > note")
+	// a separate vit command: a new driver with no memory of the first
+	second := driver(t, run)
+	defer second.Shutdown(ctx, "vm2")
+	if !second.Running(ctx, "vm2") {
+		t.Fatal("a new driver must find the running VM")
+	}
+	if got := sh(t, second, "vm2", "cat note"); got != "persisted" {
+		t.Fatalf("second driver read %q", got)
+	}
+}
+
+func TestGuestFiles(t *testing.T) {
+	f := driver(t, t.TempDir())
+	ctx := context.Background()
+	f.Boot(ctx, "vm3", "")
+	defer f.Shutdown(ctx, "vm3")
+	blobs := map[string][]byte{"h1": []byte("alpha\n"), "h2": []byte("beta\n")}
+	tr := &tree.Tree{Entries: tree.Sorted([]tree.Entry{
+		{Path: "a.txt", Mode: 0o644, Hash: "h1"}, {Path: "d", Dir: true, Mode: 0o755},
+		{Path: "d/b.txt", Mode: 0o600, Hash: "h2"}, {Path: "l", Link: "a.txt"},
+	})}
+	sh(t, f, "vm3", "echo stale > old.txt")
+	err := f.WriteTree(ctx, "vm3", tr, func(h string) ([]byte, error) { return blobs[h], nil })
 	if err != nil {
 		t.Fatal(err)
 	}
-	log := calls(t, run, "vm2")
-	// order matters: pause, create, resume
-	iPause := strings.Index(log, `PATCH /vm {"state":"Paused"}`)
-	iCreate := strings.Index(log, "PUT /snapshot/create")
-	iResume := strings.Index(log, `PATCH /vm {"state":"Resumed"}`)
-	if iPause < 0 || iCreate < 0 || iResume < 0 || !(iPause < iCreate && iCreate < iResume) {
-		t.Fatalf("snapshot order wrong:\n%s", log)
+	entries, err := f.ListFiles(ctx, "vm3")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if b, _ := os.ReadFile(memPath); string(b) != "fake-memory-image" {
-		t.Fatalf("memory file not written: %q", b)
+	got := map[string]tree.Entry{}
+	for _, e := range entries {
+		got[e.Path] = e
 	}
-	if b, _ := os.ReadFile(statePath); string(b) != "fake-vm-state" {
-		t.Fatalf("state file not written: %q", b)
+	if _, stale := got["old.txt"]; stale {
+		t.Fatal("WriteTree must replace the work tree, not add to it")
+	}
+	if got["a.txt"].Hash == "" || !got["d"].Dir || got["l"].Link != "a.txt" {
+		t.Fatalf("listing: %+v", entries)
+	}
+	if b, _ := f.ReadFile(ctx, "vm3", "d/b.txt"); string(b) != "beta\n" {
+		t.Fatalf("read %q", b)
 	}
 }
 
-func TestRestoreLoadsSnapshot(t *testing.T) {
-	f, run := newDriver(t)
+func TestSnapshotAndForkCarryMemoryAndDisk(t *testing.T) {
+	f := driver(t, t.TempDir())
 	ctx := context.Background()
-	f.Boot(ctx, "vm3", t.TempDir())
-	dir := t.TempDir()
-	mem, state, _ := f.Snapshot(ctx, "vm3", dir)
-	if err := f.Fork(ctx, "vm3-fork", t.TempDir(), mem, state); err != nil {
+	f.Boot(ctx, "orig", "")
+	defer f.Shutdown(ctx, "orig")
+	sh(t, f, "orig", "echo at-snapshot > f")
+	nonce := sh(t, f, "orig", "cat ../ram")
+	img, err := f.Snapshot(ctx, "orig", t.TempDir())
+	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Shutdown(ctx, "vm3")
-	defer f.Shutdown(ctx, "vm3-fork")
-	log := calls(t, run, "vm3-fork")
-	if !strings.Contains(log, "PUT /snapshot/load") || !strings.Contains(log, `"resume_vm":true`) {
-		t.Fatalf("fork did not load-and-resume the snapshot:\n%s", log)
+	log := calls(t, f, "orig")
+	iP := strings.Index(log, `PATCH /vm {"state":"Paused"}`)
+	iC := strings.Index(log, "PUT /snapshot/create")
+	iR := strings.Index(log, `PATCH /vm {"state":"Resumed"}`)
+	if !(iP >= 0 && iP < iC && iC < iR) {
+		t.Fatalf("snapshot must pause, create, resume:\n%s", log)
+	}
+	sh(t, f, "orig", "echo after > f") // the original moves on
+	if err := f.Resume(ctx, "fork", "", img); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Shutdown(ctx, "fork")
+	if got := sh(t, f, "fork", "cat ../ram"); got != nonce {
+		t.Fatalf("fork memory %q, want the snapshot's %q", got, nonce)
+	}
+	if got := sh(t, f, "fork", "cat f"); got != "at-snapshot" {
+		t.Fatalf("fork disk has f=%q, want the snapshot's", got)
+	}
+	if !strings.Contains(calls(t, f, "fork"), "cwd="+f.dir("fork")+" PUT /snapshot/load") {
+		t.Fatal("the fork must load in its own directory")
+	}
+	sh(t, f, "fork", "echo fork > f")
+	if got := sh(t, f, "orig", "cat f"); got != "after" {
+		t.Fatalf("fork wrote into the original's disk: %q", got)
+	}
+}
+
+func TestShutdownStopsAndCleansUp(t *testing.T) {
+	f := driver(t, t.TempDir())
+	ctx := context.Background()
+	f.Boot(ctx, "vm4", "")
+	p := f.pid("vm4")
+	f.Shutdown(ctx, "vm4")
+	if f.Running(ctx, "vm4") || alive(p) {
+		t.Fatal("shutdown must stop the VM")
+	}
+	if _, err := os.Stat(f.dir("vm4")); !os.IsNotExist(err) {
+		t.Fatal("shutdown must remove the VM directory")
+	}
+}
+
+// The engine, end to end through this driver: steps, show, diff, warm fork,
+// checkout, stop and resume.
+func TestEngineThroughTheDriver(t *testing.T) {
+	f := driver(t, t.TempDir())
+	repo, _ := engine.OpenRepo(t.TempDir())
+	e := engine.New(repo, f)
+	ctx := context.Background()
+	s, _ := e.Create("vm")
+	defer f.Shutdown(ctx, s.ID)
+	run := func(sb *engine.Sandbox, script string) (*engine.Checkpoint, string) {
+		var out bytes.Buffer
+		c, err := e.Run(ctx, sb, []string{"sh", "-c", script}, &out, io.Discard)
+		if err != nil {
+			t.Fatalf("run %q: %v", script, err)
+		}
+		return c, strings.TrimSpace(out.String())
+	}
+	c1, _ := run(s, "echo one > notes.txt")
+	_, nonce := run(s, "cat ../ram")
+	if !c1.HasMemory() || c1.DiskHash == "" {
+		t.Fatal("firecracker checkpoints carry memory and disk")
+	}
+	if b, _ := e.ReadFile(c1.ID, "notes.txt"); string(b) != "one\n" {
+		t.Fatalf("show: %q", b)
+	}
+	c3, _ := run(s, "echo two >> notes.txt")
+	if ch, _ := e.Diff(c1.ID, c3.ID); len(ch) != 1 || ch[0].Kind != "modified" {
+		t.Fatalf("diff: %+v", ch)
+	}
+	fork, err := e.Fork(c1.ID, "branch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Shutdown(ctx, fork.ID)
+	if _, got := run(fork, "cat ../ram; echo; cat notes.txt"); got != nonce+"\none" {
+		t.Fatalf("warm fork: %q, want nonce %s and step 1's notes", got, nonce)
+	}
+	if err := e.Stop(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	if _, got := run(s, "cat ../ram; echo; cat notes.txt"); got != nonce+"\none\ntwo" {
+		t.Fatalf("after stop, run resumed %q", got)
 	}
 }

@@ -16,7 +16,7 @@ type ProcessBackend struct{}
 func (ProcessBackend) Name() string { return "process" }
 
 // Exec runs the command and returns its exit code.
-func (ProcessBackend) Exec(ctx context.Context, workDir string, command []string, env []string, stdout, stderr io.Writer) (int, error) {
+func (ProcessBackend) Exec(ctx context.Context, sandboxID, workDir string, command []string, env []string, stdout, stderr io.Writer) (int, error) {
 	if len(command) == 0 {
 		return 0, errors.New("empty command")
 	}

@@ -155,3 +155,10 @@ func Diff(old, new *Tree) []Change {
 func sameEntry(a, b Entry) bool {
 	return a.Mode == b.Mode && a.Size == b.Size && a.Hash == b.Hash && a.Link == b.Link && a.Dir == b.Dir
 }
+
+// Sorted returns entries sorted by path, the order a Tree keeps them in.
+func Sorted(entries []Entry) []Entry {
+	out := append([]Entry(nil), entries...)
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}

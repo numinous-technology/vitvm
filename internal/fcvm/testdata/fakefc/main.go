@@ -1,51 +1,139 @@
-// fakefc stands in for the firecracker binary in tests. It serves the REST API
-// on the --api-sock unix socket, records every call to <sock>.calls, and
-// creates the snapshot files a real firecracker would. No KVM, no VM.
+// fakefc stands in for the firecracker binary in tests. It runs in the VM's
+// directory like the real one and serves the same REST calls the driver makes.
+// The guest's work tree is kept packed inside the drive file ("the disk"), and
+// a boot nonce lives in ./ram ("the memory"): snapshot/create writes the RAM to
+// the memory file and flushes the work tree into the disk; snapshot/load does
+// the reverse. On PUT /vsock it listens on the given (relative) path with
+// Firecracker's CONNECT handshake and serves the real guest agent. Every call
+// is logged to ./calls.log with the working directory it ran in.
 package main
 
 import (
+	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
+
+	"github.com/numinous-technology/vitvm/internal/agent"
 )
+
+var drive string // path_on_host as given (relative to our cwd)
 
 func main() {
 	var sock string
-	args := os.Args[1:]
-	for i := 0; i < len(args); i++ {
-		if args[i] == "--api-sock" && i+1 < len(args) {
-			sock = args[i+1]
+	for i, a := range os.Args {
+		if a == "--api-sock" && i+1 < len(os.Args) {
+			sock = os.Args[i+1]
 		}
 	}
-	if sock == "" {
-		os.Exit(2)
-	}
-	os.Remove(sock)
+	cwd, _ := os.Getwd()
+	logf, _ := os.OpenFile("calls.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
 		os.Exit(3)
 	}
-	calls, _ := os.Create(sock + ".calls")
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		fmt.Fprintf(calls, "%s %s %s\n", r.Method, r.URL.Path, strings.TrimSpace(string(body)))
-		calls.Sync()
-		// on snapshot/create, write the files a real firecracker produces
-		if r.URL.Path == "/snapshot/create" {
-			var req struct {
-				SnapshotPath string `json:"snapshot_path"`
-				MemFilePath  string `json:"mem_file_path"`
-			}
-			json.Unmarshal(body, &req)
-			os.WriteFile(req.MemFilePath, []byte("fake-memory-image"), 0o644)
-			os.WriteFile(req.SnapshotPath, []byte("fake-vm-state"), 0o644)
+		fmt.Fprintf(logf, "cwd=%s %s %s %s\n", cwd, r.Method, r.URL.Path, strings.TrimSpace(string(body)))
+		var m map[string]any
+		json.Unmarshal(body, &m)
+		str := func(k string) string { s, _ := m[k].(string); return s }
+		switch r.URL.Path {
+		case "/drives/rootfs":
+			drive = str("path_on_host")
+		case "/vsock":
+			go serveVsock(str("uds_path"))
+		case "/actions":
+			unpack(drive, "work")
+			var b [8]byte
+			rand.Read(b[:])
+			os.WriteFile("ram", []byte(hex.EncodeToString(b[:])), 0o644)
+		case "/snapshot/create":
+			ram, _ := os.ReadFile("ram")
+			os.WriteFile(str("mem_file_path"), ram, 0o644)
+			st, _ := json.Marshal(map[string]string{"drive": drive, "vsock": vsockPath})
+			os.WriteFile(str("snapshot_path"), st, 0o644)
+			pack("work", drive) // the disk now holds the work tree, as of the pause
+		case "/snapshot/load":
+			var st map[string]string
+			b, _ := os.ReadFile(str("snapshot_path"))
+			json.Unmarshal(b, &st)
+			drive = st["drive"] // relative: resolves inside *this* VM's directory
+			mb, _ := m["mem_backend"].(map[string]any)
+			path, _ := mb["backend_path"].(string)
+			ram, _ := os.ReadFile(path)
+			os.WriteFile("ram", ram, 0o644)
+			unpack(drive, "work")
+			go serveVsock(st["vsock"])
 		}
 		w.WriteHeader(204)
+	}))
+}
+
+var vsockPath string
+
+func serveVsock(path string) {
+	vsockPath = path
+	os.Remove(path)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return
+	}
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			br := bufio.NewReader(c)
+			line, _ := br.ReadString('\n')
+			if !strings.HasPrefix(line, "CONNECT ") {
+				return
+			}
+			fmt.Fprintf(c, "OK 1073741824\n")
+			abs, _ := filepath.Abs("work")
+			agent.Handle(rw{br, c}, abs)
+		}(c)
+	}
+}
+
+type rw struct {
+	io.Reader
+	io.Writer
+}
+
+func pack(dir, file string) {
+	files := map[string][]byte{}
+	filepath.Walk(dir, func(p string, fi os.FileInfo, err error) error {
+		if err == nil && !fi.IsDir() {
+			rel, _ := filepath.Rel(dir, p)
+			files[filepath.ToSlash(rel)], _ = os.ReadFile(p)
+		}
+		return nil
 	})
-	http.Serve(ln, mux)
+	b, _ := json.Marshal(files)
+	os.WriteFile(file, b, 0o644)
+}
+
+func unpack(file, dir string) {
+	os.RemoveAll(dir)
+	os.MkdirAll(dir, 0o755)
+	b, _ := os.ReadFile(file)
+	var files map[string][]byte
+	if json.Unmarshal(b, &files) != nil {
+		return
+	}
+	for rel, data := range files {
+		p := filepath.Join(dir, filepath.FromSlash(rel))
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		os.WriteFile(p, data, 0o644)
+	}
 }

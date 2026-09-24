@@ -40,6 +40,7 @@ type Checkpoint struct {
 	// Empty for file-only (process) backends.
 	MemHash   string `json:"mem_hash,omitempty"`
 	StateHash string `json:"state_hash,omitempty"`
+	DiskHash  string `json:"disk_hash,omitempty"`
 }
 
 // HasMemory reports whether the checkpoint carries a resumable machine image.

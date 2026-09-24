@@ -113,3 +113,5 @@ func (s *Store) Has(hash string) bool {
 
 // ErrNotFound is returned when a hash is absent.
 var ErrNotFound = errors.New("blob not found")
+
+func hashOf(b []byte) string { sum := sha256.Sum256(b); return hex.EncodeToString(sum[:]) }

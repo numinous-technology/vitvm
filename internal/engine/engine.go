@@ -45,14 +45,16 @@ func (e *Engine) Create(name string) (*Sandbox, error) {
 }
 
 // Run executes a command in the sandbox and checkpoints the result. It is the
-// heart of vitvm: every step leaves a checkpoint you can return to.
+// heart of vitvm: every step leaves a checkpoint you can return to. On a
+// machine backend, a sandbox whose machine is not running is first brought
+// back from its head checkpoint (warm if it has memory, cold from its files
+// otherwise), so a sandbox survives its machine stopping or the host
+// rebooting.
 func (e *Engine) Run(ctx context.Context, s *Sandbox, command []string, stdout, stderr io.Writer) (*Checkpoint, error) {
-	if mb, ok := e.memBackend(); ok {
-		if err := mb.Boot(ctx, s.ID, e.repo.WorkDir(s.ID)); err != nil {
-			return nil, err
-		}
+	if err := e.ensureMachine(ctx, s); err != nil {
+		return nil, err
 	}
-	code, err := e.backend.Exec(ctx, e.repo.WorkDir(s.ID), command, os.Environ(), stdout, stderr)
+	code, err := e.backend.Exec(ctx, s.ID, e.repo.WorkDir(s.ID), command, os.Environ(), stdout, stderr)
 	if err != nil {
 		return nil, err
 	}
@@ -65,10 +67,26 @@ func (e *Engine) Run(ctx context.Context, s *Sandbox, command []string, stdout, 
 	return c, e.repo.SaveSandbox(s)
 }
 
-// checkpoint snapshots the sandbox's working directory into a new checkpoint
-// on top of its current head.
+// Stop shuts down the sandbox's machine, if it has one. Its history is kept;
+// the next Run resumes from the head checkpoint.
+func (e *Engine) Stop(ctx context.Context, s *Sandbox) error {
+	if mb, ok := e.memBackend(); ok {
+		return mb.Shutdown(ctx, s.ID)
+	}
+	return nil
+}
+
+// checkpoint records the sandbox's current state on top of its head: the
+// working tree always (read from the guest on a machine backend), and for a
+// real step on a memory backend the machine's memory, state and disk too.
 func (e *Engine) checkpoint(ctx context.Context, s *Sandbox, command []string, code int, note string) (*Checkpoint, error) {
-	t, err := tree.Snapshot(e.repo.WorkDir(s.ID), e.repo.CAS(), defaultIgnore)
+	var t *tree.Tree
+	var err error
+	if g, ok := e.backend.(GuestFS); ok && e.machineRunning(ctx, s) {
+		t, err = e.guestTree(ctx, g, s.ID)
+	} else {
+		t, err = tree.Snapshot(e.repo.WorkDir(s.ID), e.repo.CAS(), defaultIgnore)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -89,14 +107,6 @@ func (e *Engine) checkpoint(ctx context.Context, s *Sandbox, command []string, c
 	changes := tree.Diff(parentTree, t)
 	c := &Checkpoint{ID: newID("ck-"), Sandbox: s.ID, Seq: s.Steps, Parent: s.Head,
 		TreeHash: treeHash, Command: command, ExitCode: code, Created: time.Now().UTC(), Note: note}
-	// A real step on a memory backend also snapshots the running machine.
-	if command != nil {
-		if memHash, stateHash, err := e.captureMemory(ctx, s); err != nil {
-			return nil, err
-		} else {
-			c.MemHash, c.StateHash = memHash, stateHash
-		}
-	}
 	for _, ch := range changes {
 		switch ch.Kind {
 		case "added":
@@ -105,6 +115,11 @@ func (e *Engine) checkpoint(ctx context.Context, s *Sandbox, command []string, c
 			c.Modified++
 		case "deleted":
 			c.Deleted++
+		}
+	}
+	if command != nil {
+		if err := e.captureMachine(ctx, s, c); err != nil {
+			return nil, err
 		}
 	}
 	return c, e.repo.SaveCheckpoint(c)
@@ -164,9 +179,12 @@ func (e *Engine) Diff(fromID, toID string) ([]tree.Change, error) {
 	return tree.Diff(from, to), nil
 }
 
-// Checkout restores the sandbox's working directory to a checkpoint's state
-// and moves its head there. Later steps build on this point.
+// Checkout moves the sandbox back to a checkpoint. The working tree is
+// restored; on a machine backend the machine resumes from the checkpoint's
+// image when it has one (processes and all), and otherwise the guest's files
+// are rewritten to the checkpoint's tree. Later steps build on this point.
 func (e *Engine) Checkout(s *Sandbox, checkpointID string) error {
+	ctx := context.Background()
 	c, err := e.repo.Checkpoint(checkpointID)
 	if err != nil {
 		return err
@@ -181,18 +199,20 @@ func (e *Engine) Checkout(s *Sandbox, checkpointID string) error {
 	if err := snap.Restore(t, e.repo.CAS(), e.repo.WorkDir(s.ID)); err != nil {
 		return err
 	}
-	// resume the live machine from this checkpoint, if it carries one
-	if err := e.restoreMemory(context.Background(), c, s.ID, e.repo.WorkDir(s.ID), false); err != nil {
+	if err := e.bringUp(ctx, s.ID, c, t); err != nil {
 		return err
 	}
 	s.Head = c.ID
 	return e.repo.SaveSandbox(s)
 }
 
-// Fork makes a new sandbox whose working directory starts as the exact state
-// of a checkpoint, from any sandbox. The two share every unchanged blob, so a
-// fork is cheap. This is the "branch from step N" operation.
+// Fork makes a new sandbox that starts at a checkpoint, from any sandbox. On a
+// machine backend a checkpoint with an image forks warm: the new machine
+// resumes the original's memory and disk and the two diverge from that live
+// point. Otherwise it forks cold from the checkpoint's files. The two sandboxes
+// share every unchanged blob, so a fork is cheap.
 func (e *Engine) Fork(fromCheckpointID, name string) (*Sandbox, error) {
+	ctx := context.Background()
 	src, err := e.repo.Checkpoint(fromCheckpointID)
 	if err != nil {
 		return nil, err
@@ -209,14 +229,13 @@ func (e *Engine) Fork(fromCheckpointID, name string) (*Sandbox, error) {
 	if err := snap.Restore(t, e.repo.CAS(), e.repo.WorkDir(s.ID)); err != nil {
 		return nil, err
 	}
-	// fork the live machine from the source snapshot, if there is one
-	if err := e.restoreMemory(context.Background(), src, s.ID, e.repo.WorkDir(s.ID), true); err != nil {
+	if err := e.bringUp(ctx, s.ID, src, t); err != nil {
 		return nil, err
 	}
-	// the fork's root checkpoint carries the same tree and machine image, but a
-	// new lineage.
+	// the fork's root checkpoint carries the same tree and image, under a new
+	// lineage
 	root := &Checkpoint{ID: newID("ck-"), Sandbox: s.ID, Seq: 0, TreeHash: src.TreeHash,
-		MemHash: src.MemHash, StateHash: src.StateHash,
+		MemHash: src.MemHash, StateHash: src.StateHash, DiskHash: src.DiskHash,
 		Created: time.Now().UTC(), Note: "forked from " + fromCheckpointID}
 	if err := e.repo.SaveCheckpoint(root); err != nil {
 		return nil, err

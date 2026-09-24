@@ -51,7 +51,8 @@ func (e *Engine) Push(sandboxID string, store remote.ObjectStore) (*PushStats, e
 }
 
 func (e *Engine) pushCheckpoint(c *Checkpoint, store remote.ObjectStore, st *PushStats) error {
-	// the tree blob and every file blob it references
+	// the tree blob, every file blob it references, and the machine image:
+	// memory and disk manifests with their chunks, and the state blob
 	shas := []string{c.TreeHash}
 	t, err := e.loadTree(c.TreeHash)
 	if err != nil {
@@ -61,6 +62,20 @@ func (e *Engine) pushCheckpoint(c *Checkpoint, store remote.ObjectStore, st *Pus
 		if ent.Hash != "" {
 			shas = append(shas, ent.Hash)
 		}
+	}
+	if c.StateHash != "" {
+		shas = append(shas, c.StateHash)
+	}
+	for _, h := range []string{c.MemHash, c.DiskHash} {
+		if h == "" {
+			continue
+		}
+		m, err := e.repo.CAS().ReadManifest(h)
+		if err != nil {
+			return err
+		}
+		shas = append(shas, h)
+		shas = append(shas, m.Chunks...)
 	}
 	for _, sha := range shas {
 		if err := e.pushBlob(sha, store, st); err != nil {
@@ -123,6 +138,28 @@ func (e *Engine) Pull(store remote.ObjectStore, checkpointID string) (*Checkpoin
 	for _, ent := range t.Entries {
 		if ent.Hash != "" {
 			if _, err := e.pullBlob(ent.Hash, store); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if c.StateHash != "" {
+		if _, err := e.pullBlob(c.StateHash, store); err != nil {
+			return nil, err
+		}
+	}
+	for _, h := range []string{c.MemHash, c.DiskHash} {
+		if h == "" {
+			continue
+		}
+		if _, err := e.pullBlob(h, store); err != nil {
+			return nil, err
+		}
+		m, err := e.repo.CAS().ReadManifest(h)
+		if err != nil {
+			return nil, err
+		}
+		for _, ch := range m.Chunks {
+			if _, err := e.pullBlob(ch, store); err != nil {
 				return nil, err
 			}
 		}

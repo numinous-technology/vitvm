@@ -1,54 +1,67 @@
-// Package fcvm is vitvm's Firecracker backend: it runs a sandbox as a
-// Firecracker microVM and snapshots the guest's memory and device state at
-// each checkpoint, so a restore or a fork resumes a live process rather than
-// replaying files. It implements engine.MemoryBackend.
+// Package fcvm is vitvm's Firecracker backend: each sandbox is a Firecracker
+// microVM, and each checkpoint snapshots the guest's memory, device state and
+// root disk at one instant, so a checkout or a fork resumes a live machine.
+// It implements engine.MemoryBackend and engine.GuestFS.
 //
-// The driver speaks Firecracker's REST API over each VM's unix socket, using
-// only the standard library. It needs a Linux host with /dev/kvm, the
-// firecracker binary, a guest kernel and a root filesystem image.
+// Each VM lives in its own directory under RunDir:
+//
+//	<RunDir>/<sandbox>/api.sock    Firecracker's API socket
+//	<RunDir>/<sandbox>/v.sock      the vsock socket to the guest agent
+//	<RunDir>/<sandbox>/rootfs.ext4 the VM's own disk
+//	<RunDir>/<sandbox>/mem         the memory file a resumed VM maps
+//	<RunDir>/<sandbox>/pid, fc.log
+//
+// Firecracker runs detached, so a VM outlives the vit command that started it,
+// and the driver keeps no state of its own: any later command finds the VM
+// from its directory. The disk and vsock paths given to Firecracker are
+// relative and each Firecracker runs in its VM's directory, so a snapshot
+// records "rootfs.ext4" and "v.sock", and a fork resumed in its own directory
+// opens its own disk and socket rather than the original's.
+//
+// The driver speaks Firecracker's REST API with the standard library. It needs
+// Linux with /dev/kvm, the firecracker binary, a guest kernel, and a root
+// filesystem that runs vit-guest (scripts/build-rootfs.sh builds one).
 package fcvm
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
+	"strconv"
+	"strings"
+	"syscall"
 	"time"
+
+	"github.com/numinous-technology/vitvm/internal/engine"
 )
 
 // Config points the driver at its host tools and guest images.
 type Config struct {
 	FirecrackerBin string // path to the firecracker binary
 	KernelImage    string // uncompressed guest kernel (vmlinux)
-	RootFS         string // guest root filesystem image (ext4)
-	RunDir         string // where per-VM sockets and pidfiles live
+	RootFS         string // base root filesystem image each new VM copies
+	RunDir         string // where per-VM directories live
 	VCPUs          int    // guest vCPUs (default 1)
-	MemMiB         int    // guest memory (default 512)
+	MemMiB         int    // guest memory in MiB (default 512)
 	BootArgs       string // kernel command line
-	DisableVsock   bool   // skip the vsock device (no in-guest Exec)
+	AgentTimeout   time.Duration
 }
 
-// Firecracker is a MemoryBackend backed by real microVMs.
-type Firecracker struct {
-	cfg Config
-	mu  sync.Mutex
-	vms map[string]*vm
-}
+// Firecracker is a MemoryBackend and GuestFS backed by real microVMs.
+type Firecracker struct{ cfg Config }
 
-type vm struct {
-	id     string
-	sock   string
-	proc   *exec.Cmd
-	client *http.Client
-}
+// DefaultBootArgs start the vit init in the guest.
+const DefaultBootArgs = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/vit-init"
 
-// New builds the driver, checking the host is capable.
+// New builds the driver.
 func New(cfg Config) (*Firecracker, error) {
 	if cfg.FirecrackerBin == "" {
 		cfg.FirecrackerBin = "firecracker"
@@ -60,205 +73,262 @@ func New(cfg Config) (*Firecracker, error) {
 		cfg.MemMiB = 512
 	}
 	if cfg.BootArgs == "" {
-		cfg.BootArgs = "console=ttyS0 reboot=k panic=1 pci=off"
+		cfg.BootArgs = DefaultBootArgs
+	}
+	if cfg.AgentTimeout == 0 {
+		cfg.AgentTimeout = 60 * time.Second
 	}
 	if cfg.RunDir == "" {
 		cfg.RunDir = filepath.Join(os.TempDir(), "vit-fc")
 	}
+	abs, err := filepath.Abs(cfg.RunDir)
+	if err != nil {
+		return nil, err
+	}
+	cfg.RunDir = abs
 	if err := os.MkdirAll(cfg.RunDir, 0o755); err != nil {
 		return nil, err
 	}
-	return &Firecracker{cfg: cfg, vms: map[string]*vm{}}, nil
+	return &Firecracker{cfg: cfg}, nil
 }
 
 // Name identifies the backend.
 func (f *Firecracker) Name() string { return "firecracker" }
 
-func unixClient(sock string) *http.Client {
-	return &http.Client{Transport: &http.Transport{
+func (f *Firecracker) dir(id string) string     { return filepath.Join(f.cfg.RunDir, id) }
+func (f *Firecracker) apiSock(id string) string { return filepath.Join(f.dir(id), "api.sock") }
+func (f *Firecracker) vsock(id string) string   { return filepath.Join(f.dir(id), "v.sock") }
+
+// LogPath is the file holding a VM's console and Firecracker log.
+func (f *Firecracker) LogPath(id string) string { return filepath.Join(f.dir(id), "fc.log") }
+
+func (f *Firecracker) pid(id string) int {
+	b, err := os.ReadFile(filepath.Join(f.dir(id), "pid"))
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	return n
+}
+
+// Running reports whether the sandbox's Firecracker process is alive.
+func (f *Firecracker) Running(ctx context.Context, id string) bool {
+	p := f.pid(id)
+	if !alive(p) {
+		return false
+	}
+	// a recycled pid is not our VM
+	cmdline, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", p))
+	return bytes.Contains(cmdline, []byte(f.apiSock(id)))
+}
+
+// alive reports whether pid is a live process (not gone, not a zombie).
+func alive(pid int) bool {
+	if pid <= 0 || syscall.Kill(pid, 0) != nil {
+		return false
+	}
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return false
+	}
+	if i := bytes.LastIndexByte(stat, ')'); i >= 0 && i+2 < len(stat) {
+		return stat[i+2] != 'Z'
+	}
+	return true
+}
+
+func client(sock string) *http.Client {
+	return &http.Client{Timeout: 5 * time.Minute, Transport: &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
 		},
-	}, Timeout: 30 * time.Second}
+	}}
 }
 
-// api makes a Firecracker REST call over the VM's socket.
-func (v *vm) api(method, path string, body any) error {
-	var r *bytes.Reader
+// api makes one Firecracker REST call on the sandbox's API socket.
+func (f *Firecracker) api(id, method, path string, body any) error {
+	var r io.Reader = http.NoBody
 	if body != nil {
 		b, _ := json.Marshal(body)
 		r = bytes.NewReader(b)
-	} else {
-		r = bytes.NewReader(nil)
 	}
 	req, err := http.NewRequest(method, "http://localhost"+path, r)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := v.client.Do(req)
+	resp, err := client(f.apiSock(id)).Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		buf := make([]byte, 2048)
-		n, _ := resp.Body.Read(buf)
-		return fmt.Errorf("firecracker %s %s: %s: %s", method, path, resp.Status, string(buf[:n]))
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("firecracker %s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(msg)))
 	}
 	return nil
 }
 
-// spawn launches a firecracker process bound to a fresh API socket.
-func (f *Firecracker) spawn(ctx context.Context, id string) (*vm, error) {
-	sock := filepath.Join(f.cfg.RunDir, id+".sock")
-	os.Remove(sock)
-	cmd := exec.Command(f.cfg.FirecrackerBin, "--api-sock", sock, "--id", id)
-	logf, _ := os.Create(filepath.Join(f.cfg.RunDir, id+".log"))
-	cmd.Stdout, cmd.Stderr = logf, logf
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("starting firecracker: %w", err)
+// spawn starts a detached firecracker in the sandbox's directory and waits for
+// its API socket.
+func (f *Firecracker) spawn(id string) error {
+	d := f.dir(id)
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		return err
 	}
-	v := &vm{id: id, sock: sock, proc: cmd, client: unixClient(sock)}
-	// wait for the API socket to accept a request
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if err := v.api("GET", "/", nil); err == nil || isAPIUp(err) {
-			return v, nil
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	cmd.Process.Kill()
-	return nil, fmt.Errorf("firecracker API socket never came up for %s", id)
-}
-
-// isAPIUp reports whether an error means the API answered (any HTTP response),
-// as opposed to the socket not being ready.
-func isAPIUp(err error) bool {
-	// once the socket accepts connections, GET / returns an HTTP error, not a
-	// dial error; treat a non-nil HTTP status as "up".
-	return err != nil && (bytes.Contains([]byte(err.Error()), []byte("firecracker")) ||
-		bytes.Contains([]byte(err.Error()), []byte("Status")))
-}
-
-// Boot starts and configures the microVM.
-func (f *Firecracker) Boot(ctx context.Context, id, workDir string) error {
-	f.mu.Lock()
-	if _, ok := f.vms[id]; ok {
-		f.mu.Unlock()
-		return nil
-	}
-	f.mu.Unlock()
-	v, err := f.spawn(ctx, id)
+	os.Remove(f.apiSock(id))
+	os.Remove(f.vsock(id))
+	logf, err := os.OpenFile(f.LogPath(id), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
-	if err := v.api("PUT", "/boot-source", map[string]any{
-		"kernel_image_path": f.cfg.KernelImage, "boot_args": f.cfg.BootArgs,
-	}); err != nil {
+	defer logf.Close()
+	cmd := exec.Command(f.cfg.FirecrackerBin, "--api-sock", f.apiSock(id), "--id", strings.ReplaceAll(id, "_", "-"))
+	cmd.Dir = d
+	cmd.Stdout, cmd.Stderr = logf, logf
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("starting firecracker: %w", err)
+	}
+	pid := cmd.Process.Pid
+	cmd.Process.Release() // detached: it outlives this process
+	if err := os.WriteFile(filepath.Join(d, "pid"), []byte(strconv.Itoa(pid)), 0o644); err != nil {
 		return err
 	}
-	if err := v.api("PUT", "/drives/rootfs", map[string]any{
-		"drive_id": "rootfs", "path_on_host": f.cfg.RootFS,
-		"is_root_device": true, "is_read_only": false,
-	}); err != nil {
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if c, err := net.Dial("unix", f.apiSock(id)); err == nil {
+			c.Close()
+			return nil
+		}
+	}
+	syscall.Kill(pid, syscall.SIGKILL)
+	return fmt.Errorf("firecracker API socket never came up for %s (see %s)", id, f.LogPath(id))
+}
+
+// copyFile copies src to dst, sharing blocks with a reflink where the
+// filesystem supports it and keeping holes sparse.
+func copyFile(src, dst string) error {
+	out, err := exec.Command("cp", "--reflink=auto", "--sparse=always", src, dst).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("copying %s: %v: %s", src, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// Boot starts a fresh VM on a copy of the base root filesystem.
+func (f *Firecracker) Boot(ctx context.Context, id, workDir string) error {
+	if f.Running(ctx, id) {
+		return nil
+	}
+	if f.cfg.KernelImage == "" || f.cfg.RootFS == "" {
+		return errors.New("firecracker backend needs a kernel and a root filesystem (vit config set firecracker.kernel / firecracker.rootfs)")
+	}
+	d := f.dir(id)
+	os.RemoveAll(d)
+	if err := os.MkdirAll(d, 0o755); err != nil {
 		return err
 	}
-	if err := v.api("PUT", "/machine-config", map[string]any{
-		"vcpu_count": f.cfg.VCPUs, "mem_size_mib": f.cfg.MemMiB,
-	}); err != nil {
+	if err := copyFile(f.cfg.RootFS, filepath.Join(d, "rootfs.ext4")); err != nil {
 		return err
 	}
-	// a vsock device so the host can reach the in-guest agent for Exec
-	if !f.cfg.DisableVsock {
-		os.Remove(vsockUDS(f.cfg.RunDir, id)) // clear a stale host-side socket
-		if err := v.api("PUT", "/vsock", map[string]any{
-			"guest_cid": 3, "uds_path": vsockUDS(f.cfg.RunDir, id),
-		}); err != nil {
+	if err := f.spawn(id); err != nil {
+		return err
+	}
+	steps := []struct {
+		method, path string
+		body         any
+	}{
+		{"PUT", "/boot-source", map[string]any{"kernel_image_path": f.cfg.KernelImage, "boot_args": f.cfg.BootArgs}},
+		{"PUT", "/drives/rootfs", map[string]any{"drive_id": "rootfs", "path_on_host": "rootfs.ext4", "is_root_device": true, "is_read_only": false}},
+		{"PUT", "/machine-config", map[string]any{"vcpu_count": f.cfg.VCPUs, "mem_size_mib": f.cfg.MemMiB}},
+		{"PUT", "/vsock", map[string]any{"guest_cid": 3, "uds_path": "v.sock"}},
+		{"PUT", "/actions", map[string]any{"action_type": "InstanceStart"}},
+	}
+	for _, s := range steps {
+		if err := f.api(id, s.method, s.path, s.body); err != nil {
+			f.Shutdown(ctx, id)
 			return err
 		}
 	}
-	if err := v.api("PUT", "/actions", map[string]any{"action_type": "InstanceStart"}); err != nil {
-		return err
-	}
-	f.mu.Lock()
-	f.vms[id] = v
-	f.mu.Unlock()
-	return nil
+	return f.waitAgent(id)
 }
 
-// Snapshot pauses the VM, writes a full snapshot (memory image + state), and
-// resumes it.
-func (f *Firecracker) Snapshot(ctx context.Context, id, dir string) (string, string, error) {
-	f.mu.Lock()
-	v := f.vms[id]
-	f.mu.Unlock()
-	if v == nil {
-		return "", "", fmt.Errorf("sandbox %s is not running", id)
+// Snapshot pauses the VM, writes a full snapshot and a copy of its disk taken
+// while paused, and resumes it.
+func (f *Firecracker) Snapshot(ctx context.Context, id, dir string) (img engine.Image, err error) {
+	if !f.Running(ctx, id) {
+		return img, fmt.Errorf("sandbox %s is not running", id)
 	}
-	memPath := filepath.Join(dir, "mem")
-	statePath := filepath.Join(dir, "state")
-	if err := v.api("PATCH", "/vm", map[string]any{"state": "Paused"}); err != nil {
-		return "", "", err
-	}
-	if err := v.api("PUT", "/snapshot/create", map[string]any{
-		"snapshot_type": "Full", "snapshot_path": statePath, "mem_file_path": memPath,
-	}); err != nil {
-		return "", "", err
-	}
-	if err := v.api("PATCH", "/vm", map[string]any{"state": "Resumed"}); err != nil {
-		return "", "", err
-	}
-	return memPath, statePath, nil
-}
-
-// loadFrom launches a fresh VM and loads a snapshot into it, resuming.
-func (f *Firecracker) loadFrom(ctx context.Context, id, memPath, statePath string) error {
-	v, err := f.spawn(ctx, id)
+	absDir, err := filepath.Abs(dir)
 	if err != nil {
-		return err
+		return img, err
 	}
-	if err := v.api("PUT", "/snapshot/load", map[string]any{
-		"snapshot_path": statePath, "mem_file_path": memPath, "resume_vm": true,
-		"enable_diff_snapshots": false,
+	img = engine.Image{Memory: filepath.Join(absDir, "mem"), State: filepath.Join(absDir, "state"), Disk: filepath.Join(absDir, "disk")}
+	if err := f.api(id, "PATCH", "/vm", map[string]any{"state": "Paused"}); err != nil {
+		return img, err
+	}
+	defer func() {
+		if rerr := f.api(id, "PATCH", "/vm", map[string]any{"state": "Resumed"}); rerr != nil && err == nil {
+			err = rerr
+		}
+	}()
+	if err := f.api(id, "PUT", "/snapshot/create", map[string]any{
+		"snapshot_type": "Full", "snapshot_path": img.State, "mem_file_path": img.Memory,
 	}); err != nil {
+		return img, err
+	}
+	if err := copyFile(filepath.Join(f.dir(id), "rootfs.ext4"), img.Disk); err != nil {
+		return img, err
+	}
+	return img, nil
+}
+
+// Resume replaces the sandbox's VM with one loaded from an image: the disk and
+// memory are copied into the VM's directory and Firecracker loads the snapshot
+// there and resumes it.
+func (f *Firecracker) Resume(ctx context.Context, id, workDir string, img engine.Image) error {
+	f.Shutdown(ctx, id)
+	d := f.dir(id)
+	os.RemoveAll(d)
+	if err := os.MkdirAll(d, 0o755); err != nil {
 		return err
 	}
-	f.mu.Lock()
-	f.vms[id] = v
-	f.mu.Unlock()
-	return nil
+	if img.Disk == "" {
+		return errors.New("a firecracker image needs its disk")
+	}
+	if err := copyFile(img.Disk, filepath.Join(d, "rootfs.ext4")); err != nil {
+		return err
+	}
+	if err := copyFile(img.Memory, filepath.Join(d, "mem")); err != nil {
+		return err
+	}
+	if err := copyFile(img.State, filepath.Join(d, "state")); err != nil {
+		return err
+	}
+	if err := f.spawn(id); err != nil {
+		return err
+	}
+	if err := f.api(id, "PUT", "/snapshot/load", map[string]any{
+		"snapshot_path": filepath.Join(d, "state"),
+		"mem_backend":   map[string]any{"backend_type": "File", "backend_path": filepath.Join(d, "mem")},
+		"resume_vm":     true,
+	}); err != nil {
+		f.Shutdown(ctx, id)
+		return err
+	}
+	return f.waitAgent(id)
 }
 
-// Restore resumes the sandbox's machine from a snapshot.
-func (f *Firecracker) Restore(ctx context.Context, id, workDir, memPath, statePath string) error {
-	f.Shutdown(ctx, id)
-	return f.loadFrom(ctx, id, memPath, statePath)
-}
-
-// Fork resumes a copy of a snapshot as a new sandbox.
-func (f *Firecracker) Fork(ctx context.Context, newID, workDir, memPath, statePath string) error {
-	return f.loadFrom(ctx, newID, memPath, statePath)
-}
-
-// Shutdown stops the sandbox's machine.
+// Shutdown kills the sandbox's VM and removes its directory. Its state lives
+// in checkpoints, not here.
 func (f *Firecracker) Shutdown(ctx context.Context, id string) error {
-	f.mu.Lock()
-	v := f.vms[id]
-	delete(f.vms, id)
-	f.mu.Unlock()
-	if v == nil {
-		return nil
+	if f.Running(ctx, id) {
+		p := f.pid(id)
+		syscall.Kill(p, syscall.SIGKILL)
+		for i := 0; i < 200 && alive(p); i++ {
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
-	if v.proc != nil && v.proc.Process != nil {
-		v.proc.Process.Kill()
-		v.proc.Wait()
-	}
-	os.Remove(v.sock)
+	os.RemoveAll(f.dir(id))
 	return nil
-}
-
-// LogPath returns the file that captures a VM's console and Firecracker log.
-func (f *Firecracker) LogPath(id string) string {
-	return filepath.Join(f.cfg.RunDir, id+".log")
 }
