@@ -75,7 +75,30 @@ M=$(cat /root/demo/.vit/checkpoints/*.json | grep -c '"mem_hash"')
 LOGICAL=$(( M * (512 + 1024) ))
 USED=$(( $(du -sm /root/demo/.vit/blobs | cut -f1) ))
 echo "  $M machine checkpoints; stored whole they would be $LOGICAL MiB; the repo holds $USED MiB"
+echo "  guest console check: $(grep -h 'overlay root' /tmp/vit-fc/*/fc.log 2>/dev/null | head -1)"
 check "chunked images dedupe (repo < 25% of whole images)" "[ $USED -lt $((LOGICAL/4)) ]"
-for s in $(vit ls | grep -o 'sbx-[0-9a-f]*'); do vit stop $s >/dev/null 2>&1; done
+echo "##### speed"
+cd /root/demo
+steps(){ # $1 sandbox name; five small steps; prints each step's ms and the median
+  vit new $1 >/dev/null; vit run -- true >/dev/null
+  B0=$(du -sm /root/demo/.vit/blobs | cut -f1); TS=""
+  for i in 1 2 3 4 5; do timed vit run -- sh -c "echo $i >> f; head -c 100000 /dev/urandom > r$i" >/dev/null; TS="$TS $T"; done
+  B1=$(du -sm /root/demo/.vit/blobs | cut -f1)
+  MED=$(echo $TS | tr ' ' '\n' | sort -n | sed -n 3p)
+  echo "  $1: step ms:$TS  median $MED; storage +$(( (B1-B0)/5 )) MiB per step"
+}
+steps perf
+PERF_MED=$MED
+S=$(ck 3 perf)
+timed vit fork $S f1 >/dev/null; FORK1=$T
+vit use perf >/dev/null
+timed vit fork $S f2 >/dev/null; FORK2=$T
+echo "  fork: first ${FORK1} ms (image reassembled), second ${FORK2} ms (from the cache)"
+vit run -- cat f | head -3 | tr '\n' ' '; echo "(the fork's f)"
+check "a small step takes under 1.5 s" "[ $PERF_MED -lt 1500 ]"
+check "a fork from the cache takes under 1 s" "[ $FORK2 -lt 1000 ]"
+VIT_FIRECRACKER_DISK_MODE=copy steps perfcopy
+echo "  (perfcopy: the old full-disk mode, for comparison)"
+for s in $(vit ls | grep -o 'sbx-[0-9a-f]*'); do VIT_FIRECRACKER_DISK_MODE=copy vit stop $s >/dev/null 2>&1; vit stop $s >/dev/null 2>&1; done
 VIT_DIR=/root/repo2/.vit vit stop pulled >/dev/null 2>&1
 echo "##### result: $PASS passed, $FAIL failed"

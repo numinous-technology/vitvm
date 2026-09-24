@@ -73,30 +73,41 @@ func initMain() {
 
 // overlayRoot mounts /dev/vdb, layers it over the read-only root with
 // overlayfs, moves /proc, /sys and /dev across, and pivots into the result.
-// All scratch mountpoints live on a tmpfs, since the base root is read-only.
+// Scratch mountpoints live on a tmpfs, since the base root is read-only; it
+// goes over the first of /mnt, /tmp or /media the base image has.
 func overlayRoot() error {
-	if err := syscall.Mount("tmpfs", "/mnt", "tmpfs", 0, "mode=0755"); err != nil {
-		return fmt.Errorf("tmpfs on /mnt: %w", err)
+	scratch := ""
+	for _, d := range []string{"/mnt", "/tmp", "/media"} {
+		if fi, err := os.Stat(d); err == nil && fi.IsDir() {
+			scratch = d
+			break
+		}
 	}
-	for _, d := range []string{"/mnt/upper", "/mnt/root"} {
-		os.MkdirAll(d, 0o755)
+	if scratch == "" {
+		return fmt.Errorf("the base image has no /mnt, /tmp or /media to work in")
 	}
-	if err := syscall.Mount("/dev/vdb", "/mnt/upper", "ext4", 0, "noinit_itable"); err != nil {
+	if err := syscall.Mount("tmpfs", scratch, "tmpfs", 0, "mode=0755"); err != nil {
+		return fmt.Errorf("tmpfs on %s: %w", scratch, err)
+	}
+	upper, root := scratch+"/upper", scratch+"/root"
+	os.MkdirAll(upper, 0o755)
+	os.MkdirAll(root, 0o755)
+	if err := syscall.Mount("/dev/vdb", upper, "ext4", 0, "noinit_itable"); err != nil {
 		return fmt.Errorf("mounting the writable disk: %w", err)
 	}
-	os.MkdirAll("/mnt/upper/upper", 0o755)
-	os.MkdirAll("/mnt/upper/work", 0o755)
-	opts := "lowerdir=/,upperdir=/mnt/upper/upper,workdir=/mnt/upper/work"
-	if err := syscall.Mount("overlay", "/mnt/root", "overlay", 0, opts); err != nil {
+	os.MkdirAll(upper+"/upper", 0o755)
+	os.MkdirAll(upper+"/work", 0o755)
+	opts := "lowerdir=/,upperdir=" + upper + "/upper,workdir=" + upper + "/work"
+	if err := syscall.Mount("overlay", root, "overlay", 0, opts); err != nil {
 		return fmt.Errorf("overlay: %w", err)
 	}
 	for _, m := range []string{"/proc", "/sys", "/dev"} {
-		if err := syscall.Mount(m, "/mnt/root"+m, "", syscall.MS_MOVE, ""); err != nil {
+		if err := syscall.Mount(m, root+m, "", syscall.MS_MOVE, ""); err != nil {
 			return fmt.Errorf("moving %s: %w", m, err)
 		}
 	}
-	os.MkdirAll("/mnt/root/.oldroot", 0o700)
-	if err := syscall.PivotRoot("/mnt/root", "/mnt/root/.oldroot"); err != nil {
+	os.MkdirAll(root+"/.oldroot", 0o700)
+	if err := syscall.PivotRoot(root, root+"/.oldroot"); err != nil {
 		return fmt.Errorf("pivot_root: %w", err)
 	}
 	if err := syscall.Chdir("/"); err != nil {

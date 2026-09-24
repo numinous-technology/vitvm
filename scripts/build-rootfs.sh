@@ -25,7 +25,7 @@ case "$BASE" in
 esac
 install -m 0755 "$AGENT" "$ROOT/usr/bin/vit-guest"
 ln -sf /usr/bin/vit-guest "$ROOT/sbin/vit-init"
-mkdir -p "$ROOT/work"
+mkdir -p "$ROOT/work" "$ROOT/mnt"  # /mnt: scratch space for the overlay root
 rm -f "$OUT"
 truncate -s "${SIZE}M" "$OUT"
 mkfs.ext4 -q -F -d "$ROOT" "$OUT"

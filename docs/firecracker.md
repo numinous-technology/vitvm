@@ -14,21 +14,40 @@ it, with its processes still running.
 2. The command runs inside the guest through the vitvm agent.
 3. The engine reads the guest's `/work` tree through the agent. Files carry a
    hash computed in the guest, so only contents the store lacks cross over.
-4. The machine is paused, Firecracker writes a full snapshot (memory and device
-   state), the disk is copied while still paused, and the machine resumes.
-5. Memory and disk are stored as 1 MiB content-addressed chunks with a small
-   manifest each; the device state is a plain blob. The checkpoint records the
-   tree and the three image hashes.
+4. The machine is paused, Firecracker writes a diff snapshot (only the memory
+   pages dirtied since the last step) and the device state, the writable disk
+   is copied while still paused, and the machine resumes.
+5. The diff is laid over the previous step's memory image: chunks it does not
+   touch keep their hashes without being read, so memory costs what changed.
+   The writable disk is chunked the same way, skipping its holes. The
+   checkpoint records the tree, the memory, disk and base disk manifests, and
+   the device state.
 
 Because the disk is captured at the same instant as memory, a resumed machine
-never sees a filesystem that moved on without it.
+never sees a filesystem that moved on without it. A diff is taken only when
+the driver can confirm which stored image the VM's memory derives from (it
+records that in the VM's directory on every resume and snapshot); otherwise
+the snapshot is full, so a mismatch costs time and never correctness.
+
+## Disks
+
+By default the root filesystem is a shared read-only base, the same file for
+every VM, with a sparse 8 GiB writable disk layered over it inside the guest
+(overlayfs, then `pivot_root`). The base is stored in the repo once per
+distinct file; only the writable disk is captured per step, and it holds just
+what the sandbox wrote. `vit config firecracker.disk_mode copy` gives each VM a
+private copy of the whole root filesystem instead, for guest kernels without
+overlayfs.
 
 ## Fork and checkout
 
-A checkpoint with an image resumes warm: the disk, memory and state are
-reassembled from their chunks into the target sandbox's own directory, a new
-Firecracker loads the snapshot there, and the guest carries on. Two forks of
-one step are two independent machines from the same instant.
+A checkpoint with an image resumes warm. Its memory, state and disks are
+reassembled once into the repo's image cache (`.vit/cache`, bounded by
+`VIT_CACHE_GIB`, default 16). A new Firecracker in the target sandbox's own
+directory maps the cached memory copy-on-write, so any number of forks of one
+step share a single file, gets its own copy of the small writable disk, and
+carries on. Two forks of one step are two independent machines from the same
+instant.
 
 Each VM runs in its own directory, and the disk and vsock paths given to
 Firecracker are relative (`rootfs.ext4`, `v.sock`). A snapshot records those
@@ -45,7 +64,8 @@ a sandbox's machine from its directory under `firecracker.run_dir` (default
 ```
 /tmp/vit-fc/<sandbox>/api.sock     Firecracker's API socket
 /tmp/vit-fc/<sandbox>/v.sock       vsock socket to the guest agent
-/tmp/vit-fc/<sandbox>/rootfs.ext4  this VM's disk
+/tmp/vit-fc/<sandbox>/base.ext4    link to the shared read-only base
+/tmp/vit-fc/<sandbox>/upper.ext4   this VM's writable disk (sparse)
 /tmp/vit-fc/<sandbox>/pid, fc.log  process id; console and Firecracker log
 ```
 
@@ -83,11 +103,12 @@ and is nearly free; elsewhere it is a sparse copy.
 
 ## Cost of a step
 
-On an EC2 `c5.metal` with a 512 MiB guest and a 1 GiB disk, a step takes about
-5 seconds, most of it writing and hashing the memory snapshot and the disk
-copy, and a warm fork about 1.7 seconds. Storage grows only by the chunks a
-step changed: 11 checkpoints that would be 16.9 GB stored whole took 532 MB.
-The end-to-end transcript is in
+On an EC2 `c5.metal` with a 512 MiB guest, a small step including its full
+machine checkpoint takes 72 ms; a warm fork takes 109 ms the first time from a
+step and 37 ms after that, from the cache; the first step of a new sandbox,
+including boot, takes 1.2 s. The same steps in copy disk mode take 266 ms.
+Storage grows by the chunks a step changed, about 25 MB per small step here:
+11 checkpoints that would be 16.9 GB stored whole took 575 MB. Transcript:
 [evidence/firecracker-cli-e2e.txt](evidence/firecracker-cli-e2e.txt).
 
 ## Testing without KVM

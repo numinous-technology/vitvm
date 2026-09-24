@@ -39,11 +39,12 @@ so a file that never changes across a hundred steps is stored once. Reading or
 diffing a checkpoint is served from the store and never touches a machine.
 
 On the firecracker backend a checkpoint also holds the machine: its memory, its
-device state and its root disk, captured at the same instant. Memory and disk
-are stored as 1 MiB content-addressed chunks, so the parts that did not change
-since the last step, and all-zero regions, are stored once. On a real run, 11
-checkpoints of a 512 MiB machine with a 1 GiB disk, which would be 16.9 GB
-stored whole, took 532 MB.
+device state and its disk, captured at the same instant. Only what changed is
+written: Firecracker records the memory pages dirtied since the last step, and
+the root filesystem is a shared read-only base with a small writable layer, of
+which only the layer is captured. Both are stored as content-addressed chunks
+shared with earlier steps. On a real run, 11 checkpoints of a 512 MiB machine,
+which would be 16.9 GB stored whole, took 575 MB.
 
 ## Backends
 
@@ -157,13 +158,20 @@ driver runs against a stand-in `firecracker` binary that serves the real guest
 agent protocol.
 
 On an EC2 `c5.metal` host, the complete flow above ran through the `vit`
-command with Firecracker 1.17 and passed all 15 checks: commands run in the
+command with Firecracker 1.17 and passed all 17 checks: commands run in the
 guest kernel; a background process survives between steps; `show` and `diff`
 read machine checkpoints; a fork resumes the step's running process and its
 disk, not a later one; checkout rewinds the machine; stop and run resume it; a
-pushed checkpoint pulls and forks warm in another repo; and chunked images
-dedupe. A step on that machine takes about 5 seconds, most of it snapshotting
-512 MiB of memory and 1 GiB of disk; a warm fork takes about 1.7 seconds.
+pushed checkpoint pulls and forks warm in another repo; chunked images dedupe;
+and the speed below.
+
+| on that host, 512 MiB guest | time |
+|---|---|
+| a small step, including its full machine checkpoint | 72 ms (median of 5) |
+| warm fork, first from a step | 109 ms |
+| warm fork, again from the same step | 37 ms |
+| first step of a new sandbox, including boot | 1.2 s |
+
 Transcript: [docs/evidence/firecracker-cli-e2e.txt](docs/evidence/firecracker-cli-e2e.txt).
 
 ## How it works

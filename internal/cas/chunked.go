@@ -36,9 +36,20 @@ type Manifest struct {
 	Chunks  []string `json:"chunks"`
 }
 
+// zeroHashes memoises the hash of n zero bytes: a sparse 8 GiB disk has
+// thousands of empty chunks, and hashing each would cost more than the data.
+var zeroHashes sync.Map // int -> string
+
 // zeroHash returns the hash of n zero bytes, storing that chunk once.
 func (s *Store) zeroHash(n int) (string, error) {
-	return s.Put(make([]byte, n))
+	if h, ok := zeroHashes.Load(n); ok && s.Has(h.(string)) {
+		return h.(string), nil
+	}
+	h, err := s.Put(make([]byte, n))
+	if err == nil {
+		zeroHashes.Store(n, h)
+	}
+	return h, err
 }
 
 // span is a [start, end) byte range.
