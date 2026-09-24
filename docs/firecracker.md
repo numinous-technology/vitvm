@@ -72,6 +72,21 @@ a sandbox's machine from its directory under `firecracker.run_dir` (default
 `vit stop` kills the machine and removes its directory; everything that matters
 is in its checkpoints, and the next `vit run` resumes the head checkpoint.
 
+## Network
+
+A machine has no network device, only loopback. The one way out is a tunnel
+per gmux host in `gmux.remotes`: the guest agent listens on
+`127.0.0.1:7070` (then 7071, ...), and each connection there goes over vsock to
+host port 7070, which Firecracker hands to the unix socket `v.sock_7070` in the
+VM's directory. A forwarder (`vit __forward`) listens on that socket and
+connects to that one host. Forwarders start on every boot and resume, so a
+fork gets its own, and stop with the machine.
+
+The agent writes the guest's gmux config to `/etc/gmux/remotes.json`, and each
+command gets `GMUX_CONFIG`, `GMUX_SESSION_PREFIX` (the sandbox),
+`GMUX_OWNER` (`vit-SANDBOX`) and `GMUX_NAME` (`vit-SANDBOX-stepN`), alongside
+`VIT_SANDBOX` and `VIT_STEP`.
+
 ## The guest agent
 
 `cmd/vit-guest` is the guest's init. As PID 1 it mounts `/proc`, `/sys`, `/dev`,

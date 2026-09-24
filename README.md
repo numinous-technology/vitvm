@@ -172,6 +172,7 @@ configuration key can also come from the environment: `firecracker.kernel` is
 | `firecracker.mem_mib`, `firecracker.vcpus` | guest size (default 512 MiB, 1 vCPU) |
 | `firecracker.disk_mode` | `overlay` (default: shared base plus a writable layer) or `copy` (a full private disk per machine, for guest kernels without overlayfs) |
 | `firecracker.upper_gib` | size of the writable layer (default 8) |
+| `gmux.remotes` | GPU hosts machines may use, `NAME=TOKEN@HOST:PORT#FP,...` (see below) |
 
 Repeat forks are fast because of a local image cache in `.vit/cache`, capped by
 `VIT_CACHE_GIB` (default 16).
@@ -193,6 +194,43 @@ Works with AWS S3, MinIO, Cloudflare R2, Backblaze B2 and Ceph. Point
 `AWS_ENDPOINT_URL` at the service, and set `VIT_S3_PATH_STYLE=1` where it needs
 path-style addressing. A `dir:///path` remote works for a shared filesystem.
 Details in [docs/remotes.md](docs/remotes.md).
+
+## GPUs, with gmux
+
+A vitvm machine has no GPU. Its sister project
+[gmux](https://github.com/numinous-technology/gmux) ("tmux for GPUs") lends it
+one: a step runs `gmux run`, the job runs on a gmux host's card under a share
+and a memory cap, and its output files come back into the machine, where the
+step's checkpoint keeps them.
+
+```bash
+# on the GPU host
+gmux serve --addr :7070          # prints TOKEN@THIS-HOST:7070#FINGERPRINT
+
+# on the vitvm host (the rootfs built with GMUX_BIN=/path/to/gmux)
+vit config gmux.remotes "gpu1=TOKEN@GPU-HOST:7070#FINGERPRINT"
+vit new train
+vit run -- gmux run --share 0.25 --pull out.txt -- python bench.py out.txt
+vit fork "$(vit log | grep 'step 1' | grep -o 'ck-[0-9a-f]*')" retry   # has out.txt, no GPU rerun
+```
+
+- **Nothing else is reachable.** A machine has no network device. For each
+  configured host the guest gets a port on `127.0.0.1`, tunnelled over vsock
+  to a forwarder next to the VM that connects to that one host. gmux's TLS
+  runs end to end through it, pinned to the host's certificate.
+- **Forks don't collide.** Each sandbox has its own gmux workspace on the
+  host, so a fork's files never overwrite its parent's.
+- **GPU time is accounted per sandbox and step.** Jobs run as owner
+  `vit-SANDBOX` and are named `vit-SANDBOX-stepN`, so `gmux usage --by owner`
+  shows what each branch of a run cost.
+- **GPU memory is not checkpointed.** A fork resumes the machine, not the
+  remote job. A step that leaves a `gmux run` going in the background says so
+  as it is saved.
+
+Tested between an EC2 `c5.metal` and a DigitalOcean MI350X: a quarter of the
+card ran at 415.6 TFLOP/s from inside a machine, 416.7 from its fork, and all 9
+checks passed. Transcript:
+[docs/evidence/gmux-integration.txt](docs/evidence/gmux-integration.txt).
 
 ## Verified
 
