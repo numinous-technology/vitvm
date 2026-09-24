@@ -36,7 +36,7 @@ func (e *Engine) Create(name string) (*Sandbox, error) {
 		return nil, err
 	}
 	// an initial empty checkpoint, so a sandbox always has a root to fork from
-	c, err := e.checkpoint(s, nil, 0, "created")
+	c, err := e.checkpoint(context.Background(), s, nil, 0, "created")
 	if err != nil {
 		return nil, err
 	}
@@ -47,12 +47,17 @@ func (e *Engine) Create(name string) (*Sandbox, error) {
 // Run executes a command in the sandbox and checkpoints the result. It is the
 // heart of vitvm: every step leaves a checkpoint you can return to.
 func (e *Engine) Run(ctx context.Context, s *Sandbox, command []string, stdout, stderr io.Writer) (*Checkpoint, error) {
+	if mb, ok := e.memBackend(); ok {
+		if err := mb.Boot(ctx, s.ID, e.repo.WorkDir(s.ID)); err != nil {
+			return nil, err
+		}
+	}
 	code, err := e.backend.Exec(ctx, e.repo.WorkDir(s.ID), command, os.Environ(), stdout, stderr)
 	if err != nil {
 		return nil, err
 	}
 	s.Steps++
-	c, err := e.checkpoint(s, command, code, "")
+	c, err := e.checkpoint(ctx, s, command, code, "")
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +67,7 @@ func (e *Engine) Run(ctx context.Context, s *Sandbox, command []string, stdout, 
 
 // checkpoint snapshots the sandbox's working directory into a new checkpoint
 // on top of its current head.
-func (e *Engine) checkpoint(s *Sandbox, command []string, code int, note string) (*Checkpoint, error) {
+func (e *Engine) checkpoint(ctx context.Context, s *Sandbox, command []string, code int, note string) (*Checkpoint, error) {
 	t, err := tree.Snapshot(e.repo.WorkDir(s.ID), e.repo.CAS(), defaultIgnore)
 	if err != nil {
 		return nil, err
@@ -84,6 +89,14 @@ func (e *Engine) checkpoint(s *Sandbox, command []string, code int, note string)
 	changes := tree.Diff(parentTree, t)
 	c := &Checkpoint{ID: newID("ck-"), Sandbox: s.ID, Seq: s.Steps, Parent: s.Head,
 		TreeHash: treeHash, Command: command, ExitCode: code, Created: time.Now().UTC(), Note: note}
+	// A real step on a memory backend also snapshots the running machine.
+	if command != nil {
+		if memHash, stateHash, err := e.captureMemory(ctx, s); err != nil {
+			return nil, err
+		} else {
+			c.MemHash, c.StateHash = memHash, stateHash
+		}
+	}
 	for _, ch := range changes {
 		switch ch.Kind {
 		case "added":
@@ -168,6 +181,10 @@ func (e *Engine) Checkout(s *Sandbox, checkpointID string) error {
 	if err := snap.Restore(t, e.repo.CAS(), e.repo.WorkDir(s.ID)); err != nil {
 		return err
 	}
+	// resume the live machine from this checkpoint, if it carries one
+	if err := e.restoreMemory(context.Background(), c, s.ID, e.repo.WorkDir(s.ID), false); err != nil {
+		return err
+	}
 	s.Head = c.ID
 	return e.repo.SaveSandbox(s)
 }
@@ -192,8 +209,14 @@ func (e *Engine) Fork(fromCheckpointID, name string) (*Sandbox, error) {
 	if err := snap.Restore(t, e.repo.CAS(), e.repo.WorkDir(s.ID)); err != nil {
 		return nil, err
 	}
-	// the fork's root checkpoint carries the same tree, but a new lineage
+	// fork the live machine from the source snapshot, if there is one
+	if err := e.restoreMemory(context.Background(), src, s.ID, e.repo.WorkDir(s.ID), true); err != nil {
+		return nil, err
+	}
+	// the fork's root checkpoint carries the same tree and machine image, but a
+	// new lineage.
 	root := &Checkpoint{ID: newID("ck-"), Sandbox: s.ID, Seq: 0, TreeHash: src.TreeHash,
+		MemHash: src.MemHash, StateHash: src.StateHash,
 		Created: time.Now().UTC(), Note: "forked from " + fromCheckpointID}
 	if err := e.repo.SaveCheckpoint(root); err != nil {
 		return nil, err

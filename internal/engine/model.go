@@ -33,4 +33,14 @@ type Checkpoint struct {
 	Modified int       `json:"modified"`
 	Deleted  int       `json:"deleted"`
 	Note     string    `json:"note,omitempty"`
+
+	// Memory-backend fields. When the backend snapshots a running machine, a
+	// checkpoint also carries the guest memory image and VM state as
+	// content-addressed blobs, so a restore or a fork resumes a live process.
+	// Empty for file-only (process) backends.
+	MemHash   string `json:"mem_hash,omitempty"`
+	StateHash string `json:"state_hash,omitempty"`
 }
+
+// HasMemory reports whether the checkpoint carries a resumable machine image.
+func (c *Checkpoint) HasMemory() bool { return c.MemHash != "" && c.StateHash != "" }

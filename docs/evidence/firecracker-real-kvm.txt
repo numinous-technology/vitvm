@@ -1,0 +1,16 @@
+booting microVM...
+original VM: nonce=5598b391b8dfc1b6 counter=0
+snapshotting memory...
+snapshot taken at counter=7, mem image 268435456 bytes
+forkA resumed: nonce=5598b391b8dfc1b6 counter=10
+forkB resumed: nonce=5598b391b8dfc1b6 counter=10
+forkA after running: counter=19 (advanced 9)
+forkB after running: counter=19 (advanced 9)
+---
+PASS: both forks resumed the snapshot's live RAM
+  same in-RAM nonce as the original (5598b391b8dfc1b6), counter continued from ~7, both kept running
+cmd [uname -r] -> exit=0 err=<nil>
+  stdout: 6.1.102
+cmd [sh -c echo hello-from-guest; echo written > /work/out.txt; cat /work/out.txt] -> exit=0 err=<nil>
+  stdout: hello-from-guest
+written

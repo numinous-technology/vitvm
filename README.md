@@ -46,11 +46,13 @@ vitvm has a backend interface. What a checkpoint captures depends on it.
 - **process** (shipping): runs each step as a local process and checkpoints the
   sandbox's files afterward. Works on any machine, no hypervisor, no root. This
   is what the examples use.
-- **firecracker** (design in [docs/firecracker.md](docs/firecracker.md)): runs
-  the sandbox inside a Firecracker microVM and adds the guest's memory to each
+- **firecracker** ([docs/firecracker.md](docs/firecracker.md)): runs the
+  sandbox inside a Firecracker microVM and adds the guest's memory to each
   checkpoint, so a restore or a fork brings back a live process, not just files.
-  This is the runtime vitvm was extracted from; the open backend is being
-  brought up on a KVM host.
+  Verified on a real KVM host: a microVM boots, runs commands in the guest,
+  snapshots 256 MiB of memory, and forks that resume the live RAM (see
+  [docs/evidence/firecracker-real-kvm.txt](docs/evidence/firecracker-real-kvm.txt)).
+  Needs Linux with `/dev/kvm`.
 
 The store, the checkpoint chain, and every `vit` command are the same across
 backends. Files are always captured; memory is captured when the backend can.
@@ -136,10 +138,13 @@ dependencies; the S3 client and its request signing are standard library.
 
 The firecracker backend adds a running machine's memory to each checkpoint, so
 a restore or a fork resumes a live process rather than replaying from files. It
-is the runtime vitvm was extracted from. Its interface is in the tree and
-[docs/firecracker.md](docs/firecracker.md) describes what a KVM host needs; the
-process backend, which checkpoints files, is what ships in this build and runs
-on any machine.
+is built and verified on a real KVM host: a microVM boots, runs commands in the
+guest, snapshots its memory, and forks that resume the live RAM
+([docs/evidence/firecracker-real-kvm.txt](docs/evidence/firecracker-real-kvm.txt)).
+The driver's REST protocol and the engine's memory-checkpoint chain are covered
+by tests that run without a hypervisor. The process backend, which checkpoints
+files, runs on any machine; the firecracker backend needs Linux with
+`/dev/kvm`. See [docs/firecracker.md](docs/firecracker.md).
 
 ## License
 
