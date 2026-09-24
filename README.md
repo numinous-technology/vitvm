@@ -103,7 +103,7 @@ There is a fuller walkthrough in [examples/fork-from-step](examples/fork-from-st
 
 ## Status
 
-Early and honest about it. The process backend, the content-addressed store,
+Early. The process backend, the content-addressed store,
 the checkpoint chain, and run, log, checkout, diff, show and fork all work and
 are tested. The firecracker backend that adds live memory is documented and
 being brought up; its interface is in the tree. vitvm grew out of a production
